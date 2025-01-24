@@ -12,7 +12,8 @@ import (
 )
 
 type Leaderboard struct {
-	Players []Players `json:"Players"`
+	Players  []Players `json:"Players"`
+	Metadata Metadata  `json:"Metadata"`
 }
 type Global struct {
 	Rank      int       `json:"Rank"`
@@ -27,6 +28,10 @@ type Players struct {
 	Name        string  `json:"Name"`
 	CountryIso2 string  `json:"CountryIso2"`
 	Records     Records `json:"Records"`
+}
+
+type Metadata struct {
+	Timestamp time.Time `json:"Timestamp"`
 }
 
 func main() {
@@ -106,11 +111,17 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 
 	rank := player.Records.Global.Rank
 
+	timestamp := leaderboard.Metadata.Timestamp
+
+	relativeTime := time.Since(timestamp)
+
+	relativeTime = relativeTime.Round(time.Second)
+
 	totalPlayers := getTotalPlayers(leaderboard)
 
 	percentage := getTopPercentage(totalPlayers, rank)
 
-	print := fmt.Sprintf("%d out of %d (Top %.2f%%)", rank, totalPlayers, percentage)
+	print := fmt.Sprintf("%d out of %d (Top %.2f%%) [Updated %s ago]", rank, totalPlayers, percentage, relativeTime)
 
 	fmt.Fprint(w, print)
 }
