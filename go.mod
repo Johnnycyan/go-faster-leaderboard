@@ -1,0 +1,7 @@
+module main
+
+go 1.22.4
+
+require github.com/Johnnycyan/go-tmio-sdk v0.0.0-20240606062721-12f5259a437c
+
+require github.com/joho/godotenv v1.5.1 // indirect
