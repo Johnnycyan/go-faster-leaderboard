@@ -88,6 +88,14 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	top := r.URL.Query().Get("top")
+
+	total := r.URL.Query().Get("total")
+
+	updated := r.URL.Query().Get("updated")
+
+	displayName := r.URL.Query().Get("displayName")
+
 	id, err := tmio.GetPlayerID(username)
 	if err != nil {
 		log.Println(err)
@@ -121,7 +129,35 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 
 	percentage := getTopPercentage(totalPlayers, rank)
 
-	print := fmt.Sprintf("%d out of %d (Top %.2f%%) [Updated %s ago]", rank, totalPlayers, percentage, relativeTime)
+	var usernameSection string
+	if displayName == "true" {
+		usernameSection = fmt.Sprintf("%s is rank ", player.Name)
+	} else {
+		usernameSection = ""
+	}
+
+	var rankSection string
+	if total == "false" {
+		rankSection = fmt.Sprint(rank)
+	} else {
+		rankSection = fmt.Sprintf("%d out of %d", rank, totalPlayers)
+	}
+
+	var topSection string
+	if top == "false" {
+		topSection = ""
+	} else {
+		topSection = fmt.Sprintf(" (Top %.2f%%)", percentage)
+	}
+
+	var updatedSection string
+	if updated == "false" {
+		updatedSection = ""
+	} else {
+		updatedSection = fmt.Sprintf(" [Updated %s ago]", relativeTime)
+	}
+
+	print := fmt.Sprintf("%s%s%s%s", usernameSection, rankSection, topSection, updatedSection)
 
 	fmt.Fprint(w, print)
 }
