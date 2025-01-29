@@ -34,6 +34,12 @@ type Metadata struct {
 	Timestamp time.Time `json:"Timestamp"`
 }
 
+var (
+	cache         = make(map[string]string)
+	cacheExpiry   = make(map[string]time.Time)
+	cacheDuration = 5 * time.Hour
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		log.Fatal("Please provide the port number")
@@ -96,7 +102,7 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 
 	displayName := r.URL.Query().Get("displayName")
 
-	id, err := tmio.GetPlayerID(username)
+	id, err := getCachedPlayerID(username)
 	if err != nil {
 		log.Println(err)
 		http.Error(w, "Could not get player id", http.StatusInternalServerError)
@@ -160,4 +166,23 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 	print := fmt.Sprintf("%s%s%s%s", usernameSection, rankSection, topSection, updatedSection)
 
 	fmt.Fprint(w, print)
+}
+
+func getCachedPlayerID(username string) (string, error) {
+	if id, found := cache[username]; found {
+		if time.Now().Before(cacheExpiry[username]) {
+			return id, nil
+		}
+		delete(cache, username)
+		delete(cacheExpiry, username)
+	}
+
+	id, err := tmio.GetPlayerID(username)
+	if err != nil {
+		return "", err
+	}
+
+	cache[username] = id
+	cacheExpiry[username] = time.Now().Add(cacheDuration)
+	return id, nil
 }
