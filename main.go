@@ -28,7 +28,6 @@ type Players struct {
 	CountryIso2 string    `json:"CountryIso2"`
 	Records     []Records `json:"Records"`
 }
-
 type Metadata struct {
 	Timestamp time.Time `json:"Timestamp"`
 }
@@ -64,17 +63,36 @@ func fetchLeaderboardData() (*Leaderboard, error) {
 	return &leaderboard, nil
 }
 
-func searchLeaderboard(leaderboard *Leaderboard, id string) (Players, error) {
-	for _, player := range leaderboard.Players {
+func searchLeaderboard(leaderboard *Leaderboard, id string) (Players, int, error) {
+	for i, player := range leaderboard.Players {
 		if player.AccountID == id {
-			return player, nil
+			return player, i, nil
 		}
 	}
-	return Players{}, fmt.Errorf("player not found")
+	return Players{}, -1, fmt.Errorf("player not found")
 }
 
 func getTopPercentage(total int, rank int) float64 {
 	return float64(rank) / float64(total) * 100
+}
+
+func convertMillisecondsToSeconds(milliseconds int) time.Duration {
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+func formatDuration(d time.Duration) string {
+	minutes := int(d.Minutes())
+	seconds := int(d.Seconds()) % 60
+	milliseconds := int(d.Milliseconds()) % 1000
+	var formatted string
+	if minutes > 0 {
+		formatted = fmt.Sprintf("%dm%ds%dms", minutes, seconds, milliseconds)
+	} else if seconds > 0 {
+		formatted = fmt.Sprintf("%ds%dms", seconds, milliseconds)
+	} else {
+		formatted = fmt.Sprintf("%dms", milliseconds)
+	}
+	return formatted
 }
 
 func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
@@ -97,6 +115,8 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 
 	displayName := r.URL.Query().Get("displayName")
 
+	above := r.URL.Query().Get("above")
+
 	id, err := getCachedPlayerID(username)
 	if err != nil {
 		log.Println(err)
@@ -111,7 +131,7 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	player, err := searchLeaderboard(leaderboard, id)
+	player, index, err := searchLeaderboard(leaderboard, id)
 	if err != nil {
 		log.Println(err)
 		http.Error(w, "Player not found", http.StatusNotFound)
@@ -119,6 +139,8 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rank := player.Records[3].Rank
+
+	score := convertMillisecondsToSeconds(player.Records[3].Score)
 
 	timestamp := leaderboard.Metadata.Timestamp
 
@@ -151,6 +173,20 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 		topSection = fmt.Sprintf(" (Top %.2f%%)", percentage)
 	}
 
+	var abovePlayerSection string
+	if above == "true" {
+		if rank == 1 {
+			abovePlayerSection = ""
+		} else {
+			abovePlayer := leaderboard.Players[index-1]
+			abovePlayerScore := convertMillisecondsToSeconds(abovePlayer.Records[3].Score)
+			timeDifference := score - abovePlayerScore
+			abovePlayerSection = fmt.Sprintf(" +%s to rank %d %s", formatDuration(timeDifference), abovePlayer.Records[3].Rank, abovePlayer.Name)
+		}
+	} else {
+		abovePlayerSection = ""
+	}
+
 	var updatedSection string
 	if updated == "false" {
 		updatedSection = ""
@@ -158,7 +194,7 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 		updatedSection = fmt.Sprintf(" [Updated %s ago]", relativeTime)
 	}
 
-	print := fmt.Sprintf("%s%s%s%s", usernameSection, rankSection, topSection, updatedSection)
+	print := fmt.Sprintf("%s%s%s%s%s", usernameSection, rankSection, topSection, updatedSection, abovePlayerSection)
 
 	fmt.Fprint(w, print)
 }
