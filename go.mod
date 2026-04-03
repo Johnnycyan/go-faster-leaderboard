@@ -1,6 +1,6 @@
 module main
 
-go 1.22.4
+go 1.26.1
 
 require github.com/Johnnycyan/go-tmio-sdk v0.0.0-20240606062721-12f5259a437c
 

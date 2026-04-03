@@ -5,71 +5,211 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	tmio "github.com/Johnnycyan/go-tmio-sdk"
 )
 
-type Leaderboard struct {
-	Players  []Players `json:"Players"`
-	Metadata Metadata  `json:"Metadata"`
-	Count    int       `json:"Count"`
+// API response types
+
+type APIResponse struct {
+	Success bool    `json:"success"`
+	Message string  `json:"message"`
+	Payload Payload `json:"payload"`
 }
-type Records struct {
-	Rank      int       `json:"Rank"`
-	Score     int       `json:"Score"`
-	Timestamp time.Time `json:"Timestamp"`
-	SortOrder int       `json:"SortOrder"`
+
+type Payload struct {
+	HeatAthletesMap  map[string][]HeatAthlete `json:"heatAthletesMap"`
+	AthletesMap      map[string]Athlete       `json:"athletesMap"`
+	EventAthletesMap map[string]EventAthlete  `json:"eventAthletesMap"`
+	Pagination       Pagination               `json:"pagination"`
 }
-type Players struct {
-	AccountID   string    `json:"Id"`
-	Name        string    `json:"Name"`
-	CountryIso2 string    `json:"CountryIso2"`
-	Records     []Records `json:"Records"`
+
+type HeatAthlete struct {
+	Score          string       `json:"score"`
+	Rank           int          `json:"rank"`
+	EventAthleteId string       `json:"eventAthleteId"`
+	Metadata       HeatMetadata `json:"metadata"`
+	Laps           []Lap        `json:"laps"`
 }
-type Metadata struct {
-	Timestamp time.Time `json:"Timestamp"`
+
+type HeatMetadata struct {
+	Data HeatMetadataData `json:"data"`
+}
+
+type HeatMetadataData struct {
+	LastUpdated    string `json:"lastUpdated"`
+	AggregateRank  int    `json:"aggregateRank"`
+	AggregateScore int    `json:"aggregateScore"`
+}
+
+type Lap struct {
+	Name     string      `json:"name"`
+	Time     string      `json:"time"`
+	Metadata LapMetadata `json:"metadata"`
+}
+
+type LapMetadata struct {
+	Data LapMetadataData `json:"data"`
+}
+
+type LapMetadataData struct {
+	Rank    int    `json:"rank"`
+	MapName string `json:"mapName"`
+	ScoreMs int    `json:"scoreMs"`
+}
+
+type Athlete struct {
+	AthleteId   string `json:"athleteId"`
+	Name        string `json:"name"`
+	Nationality string `json:"nationality"`
+	ExternalId  string `json:"externalId"`
+}
+
+type EventAthlete struct {
+	EventAthleteId string  `json:"eventAthleteId"`
+	Rank           int     `json:"rank"`
+	AthleteId      string  `json:"athleteId"`
+	Athlete        Athlete `json:"athlete"`
+}
+
+type Pagination struct {
+	Limit       int    `json:"limit"`
+	TotalCount  int    `json:"totalCount"`
+	NextCursor  string `json:"nextCursor"`
+	HasNextPage bool   `json:"hasNextPage"`
+}
+
+// Cached player data
+
+type CachedPlayer struct {
+	TrackmaniaID string
+	Name         string
+	Nationality  string
+	Rank         int
+	ScoreMs      int
 }
 
 var (
-	cache         = make(map[string]string)
-	cacheExpiry   = make(map[string]time.Time)
-	cacheDuration = 5 * time.Hour
+	cacheMu        sync.RWMutex
+	cachedPlayers  []CachedPlayer
+	cachedTotal    int
+	cacheUpdatedAt time.Time
+
+	playerIDMu          sync.Mutex
+	playerIDCache       = make(map[string]string)
+	playerIDCacheExpiry = make(map[string]time.Time)
+	playerIDCacheDur    = 5 * time.Hour
 )
+
+const baseURL = "https://p-p.redbull.com/rb-red-bullf-diving-6e-77-prod-34bf88e41923/api/v1/event/trackmania/stage1?assetId=rrn%3Acontent%3Aevent-profiles%3A8d1f88a2-451f-400f-9ba3-0b1f24dd8933&limit=10000"
 
 func main() {
 	if len(os.Args) < 2 {
 		log.Fatal("Please provide the port number")
 	}
 	port := os.Args[1]
+
+	go backgroundFetcher()
+
 	http.HandleFunc("/", getLeaderboardRank)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-func fetchLeaderboardData() (*Leaderboard, error) {
-	url := "https://d3px9r1nfh13li.cloudfront.net/stage1-official.latest.json"
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, nil
+func backgroundFetcher() {
+	fetchAllPages()
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		fetchAllPages()
 	}
-	defer resp.Body.Close()
-
-	var leaderboard Leaderboard
-	err = json.NewDecoder(resp.Body).Decode(&leaderboard)
-	if err != nil {
-		return nil, err
-	}
-	return &leaderboard, nil
 }
 
-func searchLeaderboard(leaderboard *Leaderboard, id string) (Players, int, error) {
-	for i, player := range leaderboard.Players {
-		if player.AccountID == id {
-			return player, i, nil
+func fetchAllPages() {
+	var players []CachedPlayer
+	var totalCount int
+
+	pageURL := baseURL
+	pageNum := 0
+
+	for {
+		pageNum++
+		if pageNum > 20 {
+			log.Printf("Stopping fetch after %d pages to avoid infinite loop", pageNum-1)
+			break
 		}
+		resp, err := http.Get(pageURL)
+		if err != nil {
+			log.Printf("Error fetching page %d: %v", pageNum, err)
+			return
+		}
+
+		var apiResp APIResponse
+		err = json.NewDecoder(resp.Body).Decode(&apiResp)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Error decoding page %d: %v", pageNum, err)
+			return
+		}
+
+		if !apiResp.Success {
+			log.Printf("API error on page %d: %s", pageNum, apiResp.Message)
+			return
+		}
+
+		totalCount = apiResp.Payload.Pagination.TotalCount
+
+		log.Printf("Fetched page %d: %d players (total: %d)", pageNum, 100, totalCount)
+
+		for _, heatAthletes := range apiResp.Payload.HeatAthletesMap {
+			for _, ha := range heatAthletes {
+				ea, ok := apiResp.Payload.EventAthletesMap[ha.EventAthleteId]
+				if !ok {
+					continue
+				}
+
+				athlete, ok := apiResp.Payload.AthletesMap[ea.AthleteId]
+				if !ok {
+					athlete = ea.Athlete
+				}
+
+				tmID := strings.TrimPrefix(athlete.ExternalId, "trackmania_")
+				scoreMs, _ := strconv.Atoi(ha.Score)
+
+				players = append(players, CachedPlayer{
+					TrackmaniaID: tmID,
+					Name:         athlete.Name,
+					Nationality:  athlete.Nationality,
+					Rank:         ha.Rank,
+					ScoreMs:      scoreMs,
+				})
+			}
+		}
+
+		if !apiResp.Payload.Pagination.HasNextPage {
+			break
+		}
+
+		pageURL = baseURL + "&cursor=" + url.QueryEscape(apiResp.Payload.Pagination.NextCursor)
 	}
-	return Players{}, -1, fmt.Errorf("player not found")
+
+	sort.Slice(players, func(i, j int) bool {
+		return players[i].Rank < players[j].Rank
+	})
+
+	cacheMu.Lock()
+	cachedPlayers = players
+	cachedTotal = totalCount
+	cacheUpdatedAt = time.Now()
+	cacheMu.Unlock()
+
+	log.Printf("Cache updated: %d players fetched (total: %d)", len(players), totalCount)
 }
 
 func getTopPercentage(total int, rank int) float64 {
@@ -84,23 +224,21 @@ func formatDuration(d time.Duration) string {
 	minutes := int(d.Minutes())
 	seconds := int(d.Seconds()) % 60
 	milliseconds := int(d.Milliseconds()) % 1000
-	var formatted string
 	if minutes > 0 {
-		formatted = fmt.Sprintf("%dm%ds%dms", minutes, seconds, milliseconds)
+		return fmt.Sprintf("%dm%ds%dms", minutes, seconds, milliseconds)
 	} else if seconds > 0 {
-		formatted = fmt.Sprintf("%ds%dms", seconds, milliseconds)
-	} else {
-		formatted = fmt.Sprintf("%dms", milliseconds)
+		return fmt.Sprintf("%ds%dms", seconds, milliseconds)
 	}
-	return formatted
+	return fmt.Sprintf("%dms", milliseconds)
 }
 
 func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprint(w, "User not found")
+			fmt.Fprint(w, "User not found in the top 2000 players")
 		}
 	}()
+
 	username := r.URL.Query().Get("username")
 	if username == "" {
 		http.Error(w, "username is required", http.StatusBadRequest)
@@ -108,13 +246,9 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 	}
 
 	top := r.URL.Query().Get("top")
-
 	total := r.URL.Query().Get("total")
-
 	updated := r.URL.Query().Get("updated")
-
 	displayName := r.URL.Query().Get("displayName")
-
 	above := r.URL.Query().Get("above")
 
 	id, err := getCachedPlayerID(username)
@@ -124,39 +258,40 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	leaderboard, err := fetchLeaderboardData()
-	if err != nil {
-		log.Println(err)
-		http.Error(w, "Could not fetch leaderboard data", http.StatusInternalServerError)
+	cacheMu.RLock()
+	players := cachedPlayers
+	totalPlayers := cachedTotal
+	updatedAt := cacheUpdatedAt
+	cacheMu.RUnlock()
+
+	if len(players) == 0 {
+		http.Error(w, "Leaderboard data not yet available", http.StatusServiceUnavailable)
 		return
 	}
 
-	player, index, err := searchLeaderboard(leaderboard, id)
-	if err != nil {
-		log.Println(err)
-		http.Error(w, "Player not found", http.StatusNotFound)
+	var player *CachedPlayer
+	var index int
+	for i, p := range players {
+		if p.TrackmaniaID == id {
+			player = &players[i]
+			index = i
+			break
+		}
+	}
+
+	if player == nil {
+		http.Error(w, "Player not found in the top 2000 players", http.StatusNotFound)
 		return
 	}
 
-	rank := player.Records[3].Rank
-
-	score := convertMillisecondsToSeconds(player.Records[3].Score)
-
-	timestamp := leaderboard.Metadata.Timestamp
-
-	relativeTime := time.Since(timestamp)
-
-	relativeTime = relativeTime.Round(time.Second)
-
-	totalPlayers := leaderboard.Count
-
+	rank := player.Rank
+	score := convertMillisecondsToSeconds(player.ScoreMs)
+	relativeTime := time.Since(updatedAt).Round(time.Second)
 	percentage := getTopPercentage(totalPlayers, rank)
 
 	var usernameSection string
 	if displayName == "true" {
 		usernameSection = fmt.Sprintf("%s is rank ", player.Name)
-	} else {
-		usernameSection = ""
 	}
 
 	var rankSection string
@@ -167,45 +302,38 @@ func getLeaderboardRank(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var topSection string
-	if top == "false" {
-		topSection = ""
-	} else {
+	if top != "false" {
 		topSection = fmt.Sprintf(" (Top %.2f%%)", percentage)
 	}
 
 	var abovePlayerSection string
-	if above == "true" {
-		if rank == 1 {
-			abovePlayerSection = ""
-		} else {
-			abovePlayer := leaderboard.Players[index-1]
-			abovePlayerScore := convertMillisecondsToSeconds(abovePlayer.Records[3].Score)
-			timeDifference := score - abovePlayerScore
-			abovePlayerSection = fmt.Sprintf(" +%s to rank %d %s", formatDuration(timeDifference), abovePlayer.Records[3].Rank, abovePlayer.Name)
-		}
-	} else {
-		abovePlayerSection = ""
+	if above == "true" && rank > 1 && index > 0 {
+		abovePlayer := players[index-1]
+		abovePlayerScore := convertMillisecondsToSeconds(abovePlayer.ScoreMs)
+		timeDifference := score - abovePlayerScore
+		abovePlayerSection = fmt.Sprintf(" +%s to rank %d %s", formatDuration(timeDifference), abovePlayer.Rank, abovePlayer.Name)
 	}
 
 	var updatedSection string
-	if updated == "false" {
-		updatedSection = ""
-	} else {
+	if updated != "false" {
 		updatedSection = fmt.Sprintf(" [Updated %s ago]", relativeTime)
 	}
 
-	print := fmt.Sprintf("%s%s%s%s%s", usernameSection, rankSection, topSection, updatedSection, abovePlayerSection)
+	updatedSection = ""
 
-	fmt.Fprint(w, print)
+	fmt.Fprintf(w, "%s%s%s%s%s", usernameSection, rankSection, topSection, updatedSection, abovePlayerSection)
 }
 
 func getCachedPlayerID(username string) (string, error) {
-	if id, found := cache[username]; found {
-		if time.Now().Before(cacheExpiry[username]) {
+	playerIDMu.Lock()
+	defer playerIDMu.Unlock()
+
+	if id, found := playerIDCache[username]; found {
+		if time.Now().Before(playerIDCacheExpiry[username]) {
 			return id, nil
 		}
-		delete(cache, username)
-		delete(cacheExpiry, username)
+		delete(playerIDCache, username)
+		delete(playerIDCacheExpiry, username)
 	}
 
 	id, err := tmio.GetPlayerID(username)
@@ -213,7 +341,7 @@ func getCachedPlayerID(username string) (string, error) {
 		return "", err
 	}
 
-	cache[username] = id
-	cacheExpiry[username] = time.Now().Add(cacheDuration)
+	playerIDCache[username] = id
+	playerIDCacheExpiry[username] = time.Now().Add(playerIDCacheDur)
 	return id, nil
 }
