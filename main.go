@@ -104,7 +104,7 @@ var (
 	playerIDCacheDur = 24 * time.Hour
 
 	scanMaxAge         time.Duration
-	retryPollInterval  = 2 * time.Minute
+	retryPollInterval  = 1 * time.Minute
 )
 
 // WebSocket hub
@@ -326,6 +326,7 @@ func main() {
 		}
 	}
 	scanMaxAge = time.Duration(scanMaxAgeMin) * time.Minute
+	scanMaxAge += 30 * time.Second // Add a buffer to avoid edge cases
 	log.Printf("Scan max age: %d minutes", scanMaxAgeMin)
 
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
