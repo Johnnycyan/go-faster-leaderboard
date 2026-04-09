@@ -92,10 +92,18 @@ header h1 {
 }
 
 /* ── Search ── */
+.search-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 14px;
+}
 .search-wrap {
   position: relative;
   max-width: 360px;
-  margin: 14px auto 0;
+  flex: 1;
+  margin: 0;
 }
 .search-wrap input {
   width: 100%;
@@ -171,6 +179,25 @@ header h1 {
   color: #4a6278;
   font-size: 0.85rem;
   text-align: center;
+}
+.clear-highlight {
+  align-self: center;
+  padding: 9px 14px;
+  border-radius: 8px;
+  border: 1px solid #db0a40;
+  background: transparent;
+  color: #db0a40;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 0.15s,
+    color 0.15s;
+  flex-shrink: 0;
+}
+.clear-highlight:hover {
+  background: #db0a40;
+  color: #fff;
 }
 
 /* ── Divider ── */

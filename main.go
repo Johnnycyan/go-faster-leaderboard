@@ -16,6 +16,7 @@ import (
 	"time"
 
 	tmio "github.com/Johnnycyan/go-tmio-sdk"
+	"github.com/gorilla/websocket"
 
 	"github.com/joho/godotenv"
 )
@@ -101,7 +102,127 @@ var (
 
 	playerIDMu       sync.Mutex
 	playerIDCacheDur = 24 * time.Hour
+
+	scanMaxAge         time.Duration
+	retryPollInterval  = 2 * time.Minute
 )
+
+// WebSocket hub
+
+const (
+	wsWriteWait  = 10 * time.Second
+	wsPingPeriod = 30 * time.Second
+	wsPongWait   = 60 * time.Second
+)
+
+var wsUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+type wsClient struct {
+	hub  *wsHub
+	conn *websocket.Conn
+	send chan []byte
+}
+
+type wsHub struct {
+	clients    map[*wsClient]bool
+	broadcast  chan []byte
+	register   chan *wsClient
+	unregister chan *wsClient
+	mu         sync.Mutex
+}
+
+var hub = &wsHub{
+	clients:    make(map[*wsClient]bool),
+	broadcast:  make(chan []byte, 16),
+	register:   make(chan *wsClient, 16),
+	unregister: make(chan *wsClient, 16),
+}
+
+func (h *wsHub) run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			h.clients[client] = true
+			h.mu.Unlock()
+		case client := <-h.unregister:
+			h.mu.Lock()
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.send)
+			}
+			h.mu.Unlock()
+		case msg := <-h.broadcast:
+			h.mu.Lock()
+			for client := range h.clients {
+				select {
+				case client.send <- msg:
+				default:
+					delete(h.clients, client)
+					close(client.send)
+				}
+			}
+			h.mu.Unlock()
+		}
+	}
+}
+
+func (c *wsClient) writePump() {
+	ticker := time.NewTicker(wsPingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+	for {
+		select {
+		case msg, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (c *wsClient) readPump() {
+	defer func() {
+		c.hub.unregister <- c
+		c.conn.Close()
+	}()
+	c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		return nil
+	})
+	for {
+		if _, _, err := c.conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+}
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WS upgrade error: %v", err)
+		return
+	}
+	client := &wsClient{hub: hub, conn: conn, send: make(chan []byte, 8)}
+	hub.register <- client
+	go client.writePump()
+	go client.readPump()
+}
 
 const cacheDir = "cache"
 
@@ -198,13 +319,24 @@ func main() {
 	}
 	port := os.Args[1]
 
+	scanMaxAgeMin := 13
+	if v := os.Getenv("SCAN_MAX_AGE_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			scanMaxAgeMin = n
+		}
+	}
+	scanMaxAge = time.Duration(scanMaxAgeMin) * time.Minute
+	log.Printf("Scan max age: %d minutes", scanMaxAgeMin)
+
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Fatalf("Failed to create cache directory: %v", err)
 	}
 	loadLeaderboardCache()
 
+	go hub.run()
 	go backgroundFetcher()
 
+	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/cmd", getLeaderboardRank)
 	http.HandleFunc("/api/search", searchPlayers)
 	http.HandleFunc("/api/leaderboard", apiLeaderboard)
@@ -232,11 +364,22 @@ func spaHandler(fileServer http.Handler, fsys fs.FS) http.Handler {
 }
 
 func backgroundFetcher() {
-	fetchLeaderboard()
-	ticker := time.NewTicker(2 * time.Minute)
-	defer ticker.Stop()
-	for range ticker.C {
-		fetchLeaderboard()
+	for {
+		lastScanTime, fresh := fetchLeaderboard()
+		if fresh {
+			// Schedule next poll for when the scan will be scanMaxAge old
+			waitDur := time.Until(lastScanTime.Add(scanMaxAge))
+			if waitDur < 0 {
+				waitDur = 0
+			}
+			log.Printf("Next poll in %v (at %v)", waitDur.Round(time.Second), lastScanTime.Add(scanMaxAge).Format(time.RFC3339))
+			time.Sleep(waitDur)
+		} else {
+			// Data is stale, retry in 2 minutes
+			age := time.Since(lastScanTime).Round(time.Second)
+			log.Printf("Scan data is stale (age: %v), retrying in %v", age, retryPollInterval)
+			time.Sleep(retryPollInterval)
+		}
 	}
 }
 
@@ -244,29 +387,31 @@ type APIResponse struct {
 	Stages [][]Stage `json:"stages"`
 }
 
-func fetchLeaderboard() {
+// fetchLeaderboard fetches from the API, updates the cache, and returns the
+// lastScanTime from the response along with a boolean indicating whether the
+// scan data is fresh (age < scanMaxAge). Broadcasts "refresh" to WS clients
+// when fresh new data is received.
+func fetchLeaderboard() (lastScanTime time.Time, fresh bool) {
 	resp, err := http.Get(apiURL)
 	if err != nil {
 		log.Printf("Error fetching leaderboard: %v", err)
-		return
+		return time.Now(), false
 	}
 	defer resp.Body.Close()
 
 	var apiResp APIResponse
-	err = json.NewDecoder(resp.Body).Decode(&apiResp)
-	if err != nil {
+	if err = json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		log.Printf("Error decoding leaderboard: %v", err)
-		return
+		return time.Now(), false
 	}
 
 	if len(apiResp.Stages) == 0 || len(apiResp.Stages[0]) == 0 {
 		log.Println("No stages found in API response")
-		return
+		return time.Now(), false
 	}
 
 	stage := apiResp.Stages[0][0]
 
-	var lastScanTime time.Time
 	if stage.LastScan.CompletedAt != "" {
 		lastScanTime, err = time.Parse(time.RFC3339, stage.LastScan.CompletedAt)
 		if err != nil {
@@ -286,7 +431,7 @@ func fetchLeaderboard() {
 		}
 		var records []CachedRecord
 		for _, r := range p.Records {
-		records = append(records, CachedRecord{
+			records = append(records, CachedRecord{
 				MapUID:    r.MapUID,
 				ScoreMs:   r.Score,
 				Timestamp: r.Timestamp,
@@ -303,7 +448,10 @@ func fetchLeaderboard() {
 		})
 	}
 
+	fresh = time.Since(lastScanTime) < scanMaxAge
+
 	cacheMu.Lock()
+	prevUpdatedAt := cacheUpdatedAt
 	cachedPlayers = players
 	cachedTotal = len(players)
 	cacheUpdatedAt = lastScanTime
@@ -312,7 +460,14 @@ func fetchLeaderboard() {
 
 	saveLeaderboardCache(players, len(players), lastScanTime, maps)
 
-	log.Printf("Cache updated: %d players fetched (last scan: %s)", len(players), lastScanTime.Format(time.RFC3339))
+	log.Printf("Cache updated: %d players fetched (last scan: %s, fresh: %v)", len(players), lastScanTime.Format(time.RFC3339), fresh)
+
+	// Notify WS clients only when fresh data with a newer scan time arrives
+	if fresh && lastScanTime.After(prevUpdatedAt) {
+		hub.broadcast <- []byte("refresh")
+	}
+
+	return lastScanTime, fresh
 }
 
 func getTopPercentage(total int, rank int) float64 {

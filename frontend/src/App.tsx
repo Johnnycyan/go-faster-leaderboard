@@ -45,6 +45,9 @@ function App() {
   const debounceRef = useRef(0);
   const highlightRef = useRef<HTMLTableRowElement>(null);
   const initializedRef = useRef(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const wsReconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wsReconnectDelay = useRef(1000);
 
   // Read initial URL params (once)
   useEffect(() => {
@@ -73,12 +76,59 @@ function App() {
     }
   }, [page, sortBy, sortDir]);
 
-  // Fetch data on mount and when params change; auto-refresh every 2 min
+  // Keep fetchDataRef always current so the static WS handler calls the latest version
+  const fetchDataRef = useRef(fetchData);
+  useEffect(() => {
+    fetchDataRef.current = fetchData;
+  }, [fetchData]);
+
+  // Fetch data on mount and when params change
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 120000);
-    return () => clearInterval(interval);
   }, [fetchData]);
+
+  // WebSocket connection for server-push refresh
+  useEffect(() => {
+    function connect() {
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${window.location.host}/ws`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        wsReconnectDelay.current = 1000;
+      };
+
+      ws.onmessage = (event) => {
+        if (event.data === "refresh") {
+          fetchDataRef.current();
+        }
+      };
+
+      ws.onclose = () => {
+        wsRef.current = null;
+        const delay = wsReconnectDelay.current;
+        wsReconnectDelay.current = Math.min(delay * 2, 30000);
+        wsReconnectTimer.current = setTimeout(connect, delay);
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+    }
+
+    connect();
+
+    return () => {
+      if (wsReconnectTimer.current !== null) {
+        clearTimeout(wsReconnectTimer.current);
+      }
+      if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Update URL when state changes
   useEffect(() => {
@@ -319,50 +369,60 @@ function App() {
           <span>{elapsed}</span> ago &middot; Page <span>{data.page}</span> of{" "}
           <span>{data.totalPages}</span>
         </div>
-        <div className="search-wrap">
-          <span className="search-icon">
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="15"
-              height="15"
-              viewBox="0 0 20 20"
-              fill="currentColor"
+        <div className="search-row">
+          <div className="search-wrap">
+            <span className="search-icon">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="15"
+                height="15"
+                viewBox="0 0 20 20"
+                fill="currentColor"
+              >
+                <path
+                  fillRule="evenodd"
+                  d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z"
+                  clipRule="evenodd"
+                />
+              </svg>
+            </span>
+            <input
+              type="text"
+              placeholder="Search players..."
+              autoComplete="off"
+              value={searchQuery}
+              onChange={(e) => handleSearch(e.target.value)}
+            />
+            {showDropdown && (
+              <div className="search-dropdown">
+                {searchResults.length === 0 ? (
+                  <div className="no-results">No players found</div>
+                ) : (
+                  searchResults.map((r, i) => (
+                    <a key={i} onClick={() => handleSearchResultClick(r)}>
+                      <img
+                        src={`https://flagcdn.com/20x15/${r.countryISO2}.png`}
+                        onError={(e) => {
+                          e.currentTarget.style.display = "none";
+                        }}
+                        alt=""
+                        title={countryName(r.countryISO2)}
+                      />
+                      <span className="sr-name">{r.name}</span>
+                      <span className="sr-rank">#{r.rank}</span>
+                    </a>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+          {highlight && (
+            <button
+              className="clear-highlight"
+              onClick={() => setHighlight(null)}
             >
-              <path
-                fillRule="evenodd"
-                d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z"
-                clipRule="evenodd"
-              />
-            </svg>
-          </span>
-          <input
-            type="text"
-            placeholder="Search players..."
-            autoComplete="off"
-            value={searchQuery}
-            onChange={(e) => handleSearch(e.target.value)}
-          />
-          {showDropdown && (
-            <div className="search-dropdown">
-              {searchResults.length === 0 ? (
-                <div className="no-results">No players found</div>
-              ) : (
-                searchResults.map((r, i) => (
-                  <a key={i} onClick={() => handleSearchResultClick(r)}>
-                    <img
-                      src={`https://flagcdn.com/20x15/${r.countryISO2}.png`}
-                      onError={(e) => {
-                        e.currentTarget.style.display = "none";
-                      }}
-                      alt=""
-                      title={countryName(r.countryISO2)}
-                    />
-                    <span className="sr-name">{r.name}</span>
-                    <span className="sr-rank">#{r.rank}</span>
-                  </a>
-                ))
-              )}
-            </div>
+              Clear highlight
+            </button>
           )}
         </div>
       </header>
