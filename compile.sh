@@ -1,0 +1,10 @@
+#!/bin/bash
+set -e
+cd "$(dirname "$0")"
+echo "Building frontend..."
+cd frontend
+npm install
+npm run build
+cd ..
+echo "Building Go binary..."
+go build -o go-faster-leaderboard .
