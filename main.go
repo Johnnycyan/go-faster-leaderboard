@@ -537,7 +537,7 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dms", milliseconds)
 }
 
-const playersPerPage = 50
+const playersPerPage = 100
 
 func formatRaceTime(ms int) string {
 	if ms <= 0 {
