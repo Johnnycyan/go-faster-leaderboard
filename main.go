@@ -51,13 +51,13 @@ type LastScan struct {
 }
 
 type Player struct {
-	Position      int          `json:"position"`
-	PlayerInfo    PlayerInfo   `json:"player"`
-	Records       []Record     `json:"records"`
-	Rank          int          `json:"rank"`
-	Score         int          `json:"score"`
-	InCompetition bool         `json:"inCompetition"`
-	UpdatedAt     string       `json:"updatedAt"`
+	Position      int        `json:"position"`
+	PlayerInfo    PlayerInfo `json:"player"`
+	Records       []Record   `json:"records"`
+	Rank          int        `json:"rank"`
+	Score         int        `json:"score"`
+	InCompetition bool       `json:"inCompetition"`
+	UpdatedAt     string     `json:"updatedAt"`
 }
 
 type PlayerInfo struct {
@@ -103,9 +103,20 @@ var (
 	playerIDMu       sync.Mutex
 	playerIDCacheDur = 24 * time.Hour
 
-	scanMaxAge         time.Duration
-	retryPollInterval  = 1 * time.Minute
+	scanMaxAge        time.Duration
+	retryPollInterval = 5 * time.Second
 )
+
+// Scans endpoint
+
+type ScansResponse = []ScanInfo
+
+type ScanInfo struct {
+	ID           string `json:"id"`
+	StartedAt    string `json:"startedAt"`
+	CompletedAt  string `json:"completedAt"`
+	IsSuccessful bool   `json:"isSuccessful"`
+}
 
 // WebSocket hub
 
@@ -307,12 +318,17 @@ func savePlayerIDCache(cache map[string]PlayerIDEntry) {
 }
 
 var apiURL string
+var scanURL string
 
 func main() {
 	_ = godotenv.Load()
 	apiURL = os.Getenv("API_URL")
 	if apiURL == "" {
 		log.Fatal("API_URL environment variable is not set")
+	}
+	scanURL = os.Getenv("SCAN_URL")
+	if scanURL == "" {
+		log.Fatal("SCAN_URL environment variable is not set")
 	}
 	if len(os.Args) < 2 {
 		log.Fatal("Please provide the port number")
@@ -366,8 +382,9 @@ func spaHandler(fileServer http.Handler, fsys fs.FS) http.Handler {
 
 func backgroundFetcher() {
 	for {
-		lastScanTime, fresh := fetchLeaderboard()
+		lastScanTime, fresh := fetchScans()
 		if fresh {
+			fetchLeaderboard()
 			// Schedule next poll for when the scan will be scanMaxAge old
 			waitDur := time.Until(lastScanTime.Add(scanMaxAge))
 			if waitDur < 0 {
@@ -386,6 +403,35 @@ func backgroundFetcher() {
 
 type APIResponse struct {
 	Stages [][]Stage `json:"stages"`
+}
+
+func fetchScans() (lastScanTime time.Time, fresh bool) {
+	resp, err := http.Get(scanURL)
+	if err != nil {
+		return time.Now(), false
+	}
+	defer resp.Body.Close()
+
+	var scansResp ScansResponse
+	if err := json.NewDecoder(resp.Body).Decode(&scansResp); err != nil {
+		log.Printf("Error decoding scans response: %v", err)
+		return time.Now(), false
+	}
+	if len(scansResp) == 0 {
+		log.Println("No scans found in response")
+		return time.Now(), false
+	}
+	latestScan := scansResp[0]
+	if latestScan.CompletedAt != "" {
+		lastScanTime, err = time.Parse(time.RFC3339, latestScan.CompletedAt)
+		if err != nil {
+			log.Printf("Error parsing scan completedAt: %v", err)
+			return time.Now(), false
+		}
+	} else {
+		lastScanTime = time.Now()
+	}
+	return lastScanTime, time.Since(lastScanTime) < scanMaxAge
 }
 
 // fetchLeaderboard fetches from the API, updates the cache, and returns the
