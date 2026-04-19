@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import "./App.css";
-import type { LeaderboardData, SearchResult } from "./types";
+import type { LeaderboardData, SearchResult, Stage2Data } from "./types";
 
 const regionNames = new Intl.DisplayNames(["en"], { type: "region" });
 function countryName(iso2: string): string {
@@ -32,8 +32,22 @@ function formatElapsed(unixSeconds: number): string {
   return str;
 }
 
+function formatScheduledTime(unixSeconds: number): string {
+  if (unixSeconds === 0) return "";
+  return new Date(unixSeconds * 1000).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+}
+
 function App() {
   const [data, setData] = useState<LeaderboardData | null>(null);
+  const [stage2Data, setStage2Data] = useState<Stage2Data | null>(null);
+  const [stage, setStage] = useState(1);
+  const stageRef = useRef(1);
   const [page, setPage] = useState(1);
   const [sortBy, setSortBy] = useState("rank");
   const [sortDir, setSortDir] = useState("asc");
@@ -42,6 +56,54 @@ function App() {
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [showDropdown, setShowDropdown] = useState(false);
   const [elapsed, setElapsed] = useState("");
+  const [collapsedRounds, setCollapsedRounds] = useState<Set<number>>(
+    new Set(),
+  );
+
+  // Auto-collapse rounds: expand only the active/next/last-completed rounds
+  useEffect(() => {
+    if (!stage2Data) return;
+    const nowUnix = Date.now() / 1000;
+    const allMatches = (stage2Data.rounds ?? []).flatMap(
+      (r) => r.matches ?? [],
+    );
+    const roundMap = new Map<number, typeof allMatches>();
+    for (const match of allMatches) {
+      const m = match.name.match(/Round\s+(\d+)/i);
+      const rn = m ? parseInt(m[1]) : 0;
+      if (!roundMap.has(rn)) roundMap.set(rn, []);
+      roundMap.get(rn)!.push(match);
+    }
+    const sortedNums = Array.from(roundMap.keys()).sort((a, b) => a - b);
+
+    let activeRound: number | null = null;
+    let nextRound: number | null = null;
+    let lastCompletedRound: number | null = null;
+    for (const rn of sortedNums) {
+      const matches = roundMap.get(rn)!;
+      const hasActive = matches.some(
+        (m) =>
+          m.scheduledTimeUnix > 0 &&
+          m.scheduledTimeUnix <= nowUnix &&
+          m.completionTimeUnix === null,
+      );
+      const allComplete = matches.every((m) => m.completionTimeUnix !== null);
+      const hasUpcoming = matches.some((m) => m.scheduledTimeUnix > nowUnix);
+      if (hasActive && activeRound === null) activeRound = rn;
+      if (allComplete) lastCompletedRound = rn;
+      if (hasUpcoming && nextRound === null) nextRound = rn;
+    }
+
+    const expand = new Set<number>();
+    if (activeRound !== null) {
+      expand.add(activeRound);
+    } else {
+      if (lastCompletedRound !== null) expand.add(lastCompletedRound);
+      if (nextRound !== null) expand.add(nextRound);
+      if (expand.size === 0) sortedNums.forEach((rn) => expand.add(rn));
+    }
+    setCollapsedRounds(new Set(sortedNums.filter((rn) => !expand.has(rn))));
+  }, [stage2Data]);
   const debounceRef = useRef(0);
   const highlightRef = useRef<HTMLTableRowElement>(null);
   const initializedRef = useRef(false);
@@ -62,6 +124,18 @@ function App() {
     setSortBy(s);
     setSortDir(d);
     if (h) setHighlight(h);
+
+    // Stage: read from URL or default based on date
+    const stageParam = params.get("stage");
+    let defaultStage = 1;
+    if (new Date() >= new Date("2026-05-01")) {
+      defaultStage = 2;
+    }
+    const initialStage = stageParam ? parseInt(stageParam) : defaultStage;
+    if (initialStage === 2) {
+      setStage(2);
+      stageRef.current = 2;
+    }
   }, []);
 
   const fetchData = useCallback(async () => {
@@ -76,16 +150,35 @@ function App() {
     }
   }, [page, sortBy, sortDir]);
 
+  const fetchStage2Data = useCallback(async () => {
+    try {
+      const resp = await fetch("/api/stage2");
+      if (!resp.ok) return;
+      const json: Stage2Data = await resp.json();
+      setStage2Data(json);
+    } catch (err) {
+      console.error("Failed to fetch stage 2 data:", err);
+    }
+  }, []);
+
   // Keep fetchDataRef always current so the static WS handler calls the latest version
   const fetchDataRef = useRef(fetchData);
+  const fetchStage2Ref = useRef(fetchStage2Data);
   useEffect(() => {
     fetchDataRef.current = fetchData;
   }, [fetchData]);
+  useEffect(() => {
+    fetchStage2Ref.current = fetchStage2Data;
+  }, [fetchStage2Data]);
 
   // Fetch data on mount and when params change
   useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    if (stage === 1) fetchData();
+  }, [fetchData, stage]);
+
+  useEffect(() => {
+    if (stage === 2) fetchStage2Data();
+  }, [fetchStage2Data, stage]);
 
   // WebSocket connection for server-push refresh
   useEffect(() => {
@@ -100,7 +193,11 @@ function App() {
 
       ws.onmessage = (event) => {
         if (event.data === "refresh") {
-          fetchDataRef.current();
+          if (stageRef.current === 1) {
+            fetchDataRef.current();
+          } else if (stageRef.current === 2) {
+            fetchStage2Ref.current();
+          }
         }
       };
 
@@ -132,7 +229,9 @@ function App() {
 
   // Update URL when state changes
   useEffect(() => {
+    stageRef.current = stage;
     const params = new URLSearchParams();
+    if (stage !== 1) params.set("stage", String(stage));
     if (page > 1) params.set("page", String(page));
     if (sortBy !== "rank" || sortDir !== "asc") {
       params.set("sort", sortBy);
@@ -142,7 +241,7 @@ function App() {
     const qs = params.toString();
     const url = qs ? `/?${qs}` : "/";
     window.history.replaceState(null, "", url);
-  }, [page, sortBy, sortDir, highlight]);
+  }, [stage, page, sortBy, sortDir, highlight]);
 
   // Update elapsed timer every second
   useEffect(() => {
@@ -215,12 +314,18 @@ function App() {
     setSearchQuery("");
   };
 
+  const handleStageChange = (newStage: number) => {
+    setStage(newStage);
+    stageRef.current = newStage;
+    setPage(1);
+  };
+
   const getSortClass = (key: string): string => {
     if (sortBy !== key) return "sortable";
     return `sortable ${sortDir === "asc" ? "sort-asc" : "sort-desc"}`;
   };
 
-  if (!data) {
+  if (stage === 1 && !data) {
     return <div className="container loading">Loading leaderboard...</div>;
   }
 
@@ -288,8 +393,195 @@ function App() {
     </svg>
   );
 
+  const toggleRound = (ri: number) => {
+    setCollapsedRounds((prev) => {
+      const next = new Set(prev);
+      if (next.has(ri)) next.delete(ri);
+      else next.add(ri);
+      return next;
+    });
+  };
+
+  const renderStage2 = () => {
+    if (!stage2Data) {
+      return <div className="stage2-loading">Loading Stage 2 data...</div>;
+    }
+
+    const nowUnix = Date.now() / 1000;
+
+    // Flatten all matches and group by round number parsed from match name
+    const allMatches = (stage2Data.rounds ?? []).flatMap(
+      (r) => r.matches ?? [],
+    );
+    const roundMap = new Map<number, typeof allMatches>();
+    for (const match of allMatches) {
+      const m = match.name.match(/Round\s+(\d+)/i);
+      const roundNum = m ? parseInt(m[1]) : 0;
+      if (!roundMap.has(roundNum)) roundMap.set(roundNum, []);
+      roundMap.get(roundNum)!.push(match);
+    }
+    const sortedRounds = Array.from(roundMap.entries()).sort(
+      ([a], [b]) => a - b,
+    );
+
+    return (
+      <div className="stage2-rounds">
+        {sortedRounds.map(([roundNum, matches]) => {
+          const isCollapsed = collapsedRounds.has(roundNum);
+          return (
+            <div key={roundNum} className="stage2-round-section">
+              <button
+                className="round-section-header"
+                onClick={() => toggleRound(roundNum)}
+              >
+                <span className="round-section-title">
+                  Round {roundNum === 0 ? "?" : roundNum}
+                </span>
+                <span
+                  className={`round-chevron${isCollapsed ? " collapsed" : ""}`}
+                >
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 14 14"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <polyline points="2,5 7,10 12,5" />
+                  </svg>
+                </span>
+              </button>
+              {!isCollapsed && (
+                <div className="stage2-matches-row">
+                  {matches.map((match, mi) => {
+                    const isFinished = match.completionTimeUnix !== null;
+                    const isLive =
+                      !isFinished &&
+                      match.scheduledTimeUnix > 0 &&
+                      nowUnix >= match.scheduledTimeUnix;
+                    const statusLabel = isFinished
+                      ? "Finished"
+                      : isLive
+                        ? "Live"
+                        : "Upcoming";
+                    const statusClass = isFinished
+                      ? "finished"
+                      : isLive
+                        ? "live"
+                        : "upcoming";
+
+                    return (
+                      <div key={mi} className="stage2-match">
+                        <div className="match-header">
+                          <div className="match-header-left">
+                            <span className="match-name">{match.name}</span>
+                            <span
+                              className={`match-status-badge ${statusClass}`}
+                            >
+                              {statusLabel}
+                            </span>
+                          </div>
+                          <div className="match-scheduled">
+                            {formatScheduledTime(match.scheduledTimeUnix)}
+                          </div>
+                        </div>
+                        <div className="stage2-table-wrap">
+                          <table className="stage2-table">
+                            {(() => {
+                              const allPlaceholders = (
+                                match.players ?? []
+                              ).every((p) => p.isPlaceholder);
+                              return (
+                                <>
+                                  <thead>
+                                    <tr>
+                                      <th className="rank-col">#</th>
+                                      <th>Player</th>
+                                      {!allPlaceholders && (
+                                        <th className="r">Score</th>
+                                      )}
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {(match.players ?? []).map((player, pi) => {
+                                      const medalClass =
+                                        player.displayPosition === 1
+                                          ? "gold"
+                                          : player.displayPosition === 2
+                                            ? "silver"
+                                            : player.displayPosition === 3
+                                              ? "bronze"
+                                              : "";
+                                      return (
+                                        <tr key={pi} className={medalClass}>
+                                          <td className="rank-col">
+                                            {player.displayPosition}
+                                          </td>
+                                          <td className="player-col">
+                                            {player.isPlaceholder ? (
+                                              <span className="placeholder-player">
+                                                #{player.sourceRank} from{" "}
+                                                {player.sourceName}
+                                              </span>
+                                            ) : (
+                                              <div className="player-inner">
+                                                {player.countryISO2 && (
+                                                  <img
+                                                    src={`https://flagcdn.com/20x15/${player.countryISO2.toLowerCase()}.png`}
+                                                    alt={player.countryISO2}
+                                                    title={countryName(
+                                                      player.countryISO2,
+                                                    )}
+                                                    onError={(e) => {
+                                                      e.currentTarget.style.display =
+                                                        "none";
+                                                    }}
+                                                  />
+                                                )}
+                                                <span className="player-name">
+                                                  {player.name}
+                                                </span>
+                                                <span
+                                                  className={`source-rank${player.sourceRank === 1 ? " source-rank-gold" : player.sourceRank === 2 ? " source-rank-silver" : player.sourceRank === 3 ? " source-rank-bronze" : ""}`}
+                                                >
+                                                  ({player.sourceRank})
+                                                </span>
+                                              </div>
+                                            )}
+                                          </td>
+                                          {!allPlaceholders && (
+                                            <td className="r">
+                                              {player.score !== null
+                                                ? player.score
+                                                : "-"}
+                                            </td>
+                                          )}
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </>
+                              );
+                            })()}
+                          </table>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   const renderPagination = () => {
-    if (data.totalPages <= 1) return null;
+    if (!data || data.totalPages <= 1) return null;
     const windowStart = Math.max(1, data.page - 3);
     const windowEnd = Math.min(data.totalPages, data.page + 3);
     const pages: number[] = [];
@@ -364,162 +656,198 @@ function App() {
           <div className="header-wing right"></div>
         </div>
         <div className="header-sub">Leaderboard</div>
-        <div className="meta">
-          <span>{data.totalPlayers}</span> players &middot; Updated{" "}
-          <span>{elapsed}</span> ago &middot; Page <span>{data.page}</span> of{" "}
-          <span>{data.totalPages}</span>
+        <div className="stage-tabs">
+          <button
+            className={stage === 1 ? "active" : ""}
+            onClick={() => handleStageChange(1)}
+          >
+            Stage 1
+          </button>
+          <button
+            className={stage === 2 ? "active" : ""}
+            onClick={() => handleStageChange(2)}
+          >
+            Stage 2
+          </button>
+          <button className="stage-tab-disabled" disabled>
+            Stage 3
+          </button>
         </div>
-        <div className="search-row">
-          <div className="search-wrap">
-            <span className="search-icon">
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="15"
-                height="15"
-                viewBox="0 0 20 20"
-                fill="currentColor"
-              >
-                <path
-                  fillRule="evenodd"
-                  d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z"
-                  clipRule="evenodd"
+        {stage === 1 && data && (
+          <>
+            <div className="meta">
+              <span>{data.totalPlayers}</span> players &middot; Updated{" "}
+              <span>{elapsed}</span> ago &middot; Page <span>{data.page}</span>{" "}
+              of <span>{data.totalPages}</span>
+            </div>
+            <div className="search-row">
+              <div className="search-wrap">
+                <span className="search-icon">
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="15"
+                    height="15"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                  >
+                    <path
+                      fillRule="evenodd"
+                      d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                </span>
+                <input
+                  type="text"
+                  placeholder="Search players..."
+                  autoComplete="off"
+                  value={searchQuery}
+                  onChange={(e) => handleSearch(e.target.value)}
                 />
-              </svg>
-            </span>
-            <input
-              type="text"
-              placeholder="Search players..."
-              autoComplete="off"
-              value={searchQuery}
-              onChange={(e) => handleSearch(e.target.value)}
-            />
-            {showDropdown && (
-              <div className="search-dropdown">
-                {searchResults.length === 0 ? (
-                  <div className="no-results">No players found</div>
-                ) : (
-                  searchResults.map((r, i) => (
-                    <a key={i} onClick={() => handleSearchResultClick(r)}>
-                      <img
-                        src={`https://flagcdn.com/20x15/${r.countryISO2}.png`}
-                        onError={(e) => {
-                          e.currentTarget.style.display = "none";
-                        }}
-                        alt=""
-                        title={countryName(r.countryISO2)}
-                      />
-                      <span className="sr-name">{r.name}</span>
-                      <span className="sr-rank">#{r.rank}</span>
-                    </a>
-                  ))
+                {showDropdown && (
+                  <div className="search-dropdown">
+                    {searchResults.length === 0 ? (
+                      <div className="no-results">No players found</div>
+                    ) : (
+                      searchResults.map((r, i) => (
+                        <a key={i} onClick={() => handleSearchResultClick(r)}>
+                          <img
+                            src={`https://flagcdn.com/20x15/${r.countryISO2}.png`}
+                            onError={(e) => {
+                              e.currentTarget.style.display = "none";
+                            }}
+                            alt=""
+                            title={countryName(r.countryISO2)}
+                          />
+                          <span className="sr-name">{r.name}</span>
+                          <span className="sr-rank">#{r.rank}</span>
+                        </a>
+                      ))
+                    )}
+                  </div>
                 )}
               </div>
-            )}
-          </div>
-          {highlight && (
-            <button
-              className="clear-highlight"
-              onClick={() => setHighlight(null)}
-            >
-              Clear highlight
-            </button>
-          )}
-        </div>
+              {highlight && (
+                <button
+                  className="clear-highlight"
+                  onClick={() => setHighlight(null)}
+                >
+                  Clear highlight
+                </button>
+              )}
+            </div>
+          </>
+        )}
       </header>
 
       <div className="divider"></div>
-      {renderPagination()}
 
-      <div className="table-wrap">
-        <table id="leaderboard">
-          <thead>
-            <tr>
-              <th
-                className={getSortClass("rank")}
-                onClick={() => handleSort("rank")}
-              >
-                Rank
-              </th>
-              <th>Player</th>
-              {data.mapHeaders.map((h) => (
-                <th
-                  key={h.sortKey}
-                  className={`r ${getSortClass(h.sortKey)}`}
-                  onClick={() => handleSort(h.sortKey)}
-                >
-                  {h.label}
-                </th>
-              ))}
-              <th
-                className={`r ${getSortClass("total")}`}
-                onClick={() => handleSort("total")}
-              >
-                Total
-              </th>
-              <th
-                className={`improved-th ${getSortClass("improved")}`}
-                onClick={() => handleSort("improved")}
-              >
-                Last Improved
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.players.map((player, i) => (
-              <tr
-                key={i}
-                className={[
-                  player.medalClass,
-                  highlight === player.name ? "highlighted" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-                ref={highlight === player.name ? highlightRef : undefined}
-              >
-                <td className="rank-col">{player.rank}</td>
-                <td className="player-col">
-                  <div className="player-inner">
-                    {player.countryISO2 && (
-                      <img
-                        src={`https://flagcdn.com/24x18/${player.countryISO2}.png`}
-                        alt={player.countryISO2}
-                        title={countryName(player.countryISO2)}
-                        onError={(e) => {
-                          e.currentTarget.style.display = "none";
-                        }}
-                      />
-                    )}
-                    <span className="player-name">{player.name}</span>
-                  </div>
-                </td>
-                {player.mapTimes.map((t, j) => (
-                  <td key={j} className="time-col">
-                    {t !== "-" && player.mapRanks[j] > 0 && (
-                      <span
-                        className={`map-rank${player.mapRanks[j] <= 3 ? ` map-rank-${["gold", "silver", "bronze"][player.mapRanks[j] - 1]}` : ""}`}
-                      >
-                        ({player.mapRanks[j]})
-                      </span>
-                    )}{" "}
-                    {t}
-                  </td>
+      {stage === 1 && (
+        <>
+          {renderPagination()}
+          <div className="table-wrap">
+            <table id="leaderboard">
+              <thead>
+                <tr>
+                  <th
+                    className={getSortClass("rank")}
+                    onClick={() => handleSort("rank")}
+                  >
+                    Rank
+                  </th>
+                  <th>Player</th>
+                  {data?.mapHeaders.map((h) => (
+                    <th
+                      key={h.sortKey}
+                      className={`r ${getSortClass(h.sortKey)}`}
+                      onClick={() => handleSort(h.sortKey)}
+                    >
+                      {h.label}
+                    </th>
+                  ))}
+                  <th
+                    className={`r ${getSortClass("total")}`}
+                    onClick={() => handleSort("total")}
+                  >
+                    Total
+                  </th>
+                  <th
+                    className={`improved-th ${getSortClass("improved")}`}
+                    onClick={() => handleSort("improved")}
+                  >
+                    Last Improved
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {data?.players.map((player, i) => (
+                  <tr
+                    key={i}
+                    className={[
+                      player.medalClass,
+                      highlight === player.name ? "highlighted" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    ref={highlight === player.name ? highlightRef : undefined}
+                  >
+                    <td className="rank-col">{player.rank}</td>
+                    <td className="player-col">
+                      <div className="player-inner">
+                        {player.countryISO2 && (
+                          <img
+                            src={`https://flagcdn.com/24x18/${player.countryISO2}.png`}
+                            alt={player.countryISO2}
+                            title={countryName(player.countryISO2)}
+                            onError={(e) => {
+                              e.currentTarget.style.display = "none";
+                            }}
+                          />
+                        )}
+                        <span className="player-name">{player.name}</span>
+                      </div>
+                    </td>
+                    {player.mapTimes.map((t, j) => (
+                      <td key={j} className="time-col">
+                        {t !== "-" && player.mapRanks[j] > 0 && (
+                          <span
+                            className={`map-rank${player.mapRanks[j] <= 3 ? ` map-rank-${["gold", "silver", "bronze"][player.mapRanks[j] - 1]}` : ""}`}
+                          >
+                            ({player.mapRanks[j]})
+                          </span>
+                        )}{" "}
+                        {t}
+                      </td>
+                    ))}
+                    <td className="total-col">
+                      <div>{player.totalTime}</div>
+                      {player.diffToFirst !== "-" && (
+                        <div className="diff-text">{player.diffToFirst}</div>
+                      )}
+                    </td>
+                    <td className="improved-col">
+                      {formatRelativeTime(player.lastImprovedUnix)}
+                    </td>
+                  </tr>
                 ))}
-                <td className="total-col">
-                  <div>{player.totalTime}</div>
-                  {player.diffToFirst !== "-" && (
-                    <div className="diff-text">{player.diffToFirst}</div>
-                  )}
-                </td>
-                <td className="improved-col">
-                  {formatRelativeTime(player.lastImprovedUnix)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+              </tbody>
+            </table>
+          </div>
+          {renderPagination()}
+        </>
+      )}
 
-      {renderPagination()}
+      {stage === 2 && (
+        <>
+          <div className="stage2-section-header">
+            <span className="stage2-section-title">Match Results</span>
+            <span className="stage2-section-sub">
+              Updated only after match completions
+            </span>
+          </div>
+          {renderStage2()}
+        </>
+      )}
     </div>
   );
 }

@@ -34,3 +34,33 @@ export interface SearchResult {
   countryISO2: string;
   page: number;
 }
+
+export interface Stage2PlayerEntry {
+  displayPosition: number;
+  name: string;
+  trackmaniaId: string;
+  countryISO2: string;
+  sourceRank: number;
+  sourceName: string;
+  isPlaceholder: boolean;
+  rank: number | null;
+  score: number | null;
+  inCompetition: boolean;
+}
+
+export interface Stage2MatchData {
+  id: string;
+  name: string;
+  scheduledTimeUnix: number;
+  completionTimeUnix: number | null;
+  players: Stage2PlayerEntry[];
+}
+
+export interface Stage2RoundData {
+  matches: Stage2MatchData[];
+}
+
+export interface Stage2Data {
+  rounds: Stage2RoundData[];
+  updatedAtUnix: number;
+}

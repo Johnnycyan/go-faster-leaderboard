@@ -93,6 +93,8 @@ type CachedPlayer struct {
 	Records      []CachedRecord
 }
 
+const stage1MatchID = "019d4d7d-381e-7dfd-91a9-96a0c480b62d"
+
 var (
 	cacheMu        sync.RWMutex
 	cachedPlayers  []CachedPlayer
@@ -100,11 +102,18 @@ var (
 	cacheUpdatedAt time.Time
 	cachedMaps     []MapInfo
 
+	stage2Mu        sync.RWMutex
+	cachedStage2    []Stage2RoundData
+	stage2UpdatedAt time.Time
+
 	playerIDMu       sync.Mutex
 	playerIDCacheDur = 24 * time.Hour
 
 	scanMaxAge        time.Duration
 	retryPollInterval = 5 * time.Second
+
+	// Stage 1 ends on this date — no more polling needed after it
+	stage1EndDate = time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC)
 )
 
 // Scans endpoint
@@ -116,6 +125,91 @@ type ScanInfo struct {
 	StartedAt    string `json:"startedAt"`
 	CompletedAt  string `json:"completedAt"`
 	IsSuccessful bool   `json:"isSuccessful"`
+}
+
+// Stage 2 raw API types (from knockout endpoint)
+
+type Stage2RawPlayerSource struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Rank int    `json:"rank"`
+}
+
+type Stage2RawPlayerInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Country     string `json:"country"`
+	CountryISO2 string `json:"countryIso2"`
+}
+
+type Stage2RawPlayer struct {
+	Position      int                   `json:"position"`
+	Source        Stage2RawPlayerSource `json:"source"`
+	Player        *Stage2RawPlayerInfo  `json:"player"`
+	Records       interface{}           `json:"records"`
+	Rank          *int                  `json:"rank"`
+	Score         *int                  `json:"score"`
+	InCompetition bool                  `json:"inCompetition"`
+	UpdatedAt     string                `json:"updatedAt"`
+}
+
+type Stage2RawLastScan struct {
+	ID           string `json:"id"`
+	StartedAt    string `json:"startedAt"`
+	CompletedAt  string `json:"completedAt"`
+	IsSuccessful bool   `json:"isSuccessful"`
+}
+
+type Stage2RawMatch struct {
+	ID             string             `json:"id"`
+	Name           string             `json:"name"`
+	Status         string             `json:"status"`
+	ScoringType    string             `json:"scoringType"`
+	ScheduledTime  string             `json:"scheduledTime"`
+	CompletionTime *string            `json:"completionTime"`
+	LastScan       *Stage2RawLastScan `json:"lastScan"`
+	Players        []Stage2RawPlayer  `json:"players"`
+}
+
+type Stage2RawAPIResponse struct {
+	Stages [][]Stage2RawMatch `json:"stages"`
+}
+
+// Stage 2 processed / API response types
+
+type Stage2PlayerEntry struct {
+	DisplayPosition int    `json:"displayPosition"`
+	Name            string `json:"name"`
+	TrackmaniaID    string `json:"trackmaniaId"`
+	CountryISO2     string `json:"countryISO2"`
+	SourceRank      int    `json:"sourceRank"`
+	SourceName      string `json:"sourceName"`
+	IsPlaceholder   bool   `json:"isPlaceholder"`
+	Rank            *int   `json:"rank"`
+	Score           *int   `json:"score"`
+	InCompetition   bool   `json:"inCompetition"`
+}
+
+type Stage2MatchData struct {
+	ID                 string              `json:"id"`
+	Name               string              `json:"name"`
+	ScheduledTimeUnix  int64               `json:"scheduledTimeUnix"`
+	CompletionTimeUnix *int64              `json:"completionTimeUnix"`
+	Players            []Stage2PlayerEntry `json:"players"`
+}
+
+type Stage2RoundData struct {
+	Matches []Stage2MatchData `json:"matches"`
+}
+
+type Stage2APIResponse struct {
+	Rounds        []Stage2RoundData `json:"rounds"`
+	UpdatedAtUnix int64             `json:"updatedAtUnix"`
+}
+
+type DiskStage2Cache struct {
+	Rounds    []Stage2RoundData `json:"rounds"`
+	UpdatedAt time.Time         `json:"updatedAt"`
 }
 
 // WebSocket hub
@@ -290,6 +384,41 @@ func loadLeaderboardCache() {
 	log.Printf("Loaded leaderboard cache from disk: %d players", data.Total)
 }
 
+func saveStage2Cache(rounds []Stage2RoundData, updatedAt time.Time) {
+	data := DiskStage2Cache{
+		Rounds:    rounds,
+		UpdatedAt: updatedAt,
+	}
+	b, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("Error marshaling stage2 cache: %v", err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "stage2.json"), b, 0644); err != nil {
+		log.Printf("Error writing stage2 cache: %v", err)
+	}
+}
+
+func loadStage2Cache() {
+	b, err := os.ReadFile(filepath.Join(cacheDir, "stage2.json"))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("Error reading stage2 cache: %v", err)
+		}
+		return
+	}
+	var data DiskStage2Cache
+	if err := json.Unmarshal(b, &data); err != nil {
+		log.Printf("Error unmarshaling stage2 cache: %v", err)
+		return
+	}
+	stage2Mu.Lock()
+	cachedStage2 = data.Rounds
+	stage2UpdatedAt = data.UpdatedAt
+	stage2Mu.Unlock()
+	log.Printf("Loaded stage2 cache from disk: %d rounds", len(data.Rounds))
+}
+
 func loadPlayerIDCache() map[string]PlayerIDEntry {
 	b, err := os.ReadFile(filepath.Join(cacheDir, "playerids.json"))
 	if err != nil {
@@ -349,14 +478,17 @@ func main() {
 		log.Fatalf("Failed to create cache directory: %v", err)
 	}
 	loadLeaderboardCache()
+	loadStage2Cache()
 
 	go hub.run()
 	go backgroundFetcher()
+	go backgroundStage2Fetcher()
 
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/cmd", getLeaderboardRank)
 	http.HandleFunc("/api/search", searchPlayers)
 	http.HandleFunc("/api/leaderboard", apiLeaderboard)
+	http.HandleFunc("/api/stage2", apiStage2)
 
 	distFS, err := fs.Sub(frontendFS, "frontend/dist")
 	if err != nil {
@@ -382,9 +514,13 @@ func spaHandler(fileServer http.Handler, fsys fs.FS) http.Handler {
 
 func backgroundFetcher() {
 	for {
-		lastScanTime, fresh := fetchScans()
+		if !time.Now().Before(stage1EndDate) {
+			log.Printf("Stage 1 has ended (%v), background fetcher stopping", stage1EndDate.Format("2006-01-02"))
+			return
+		}
+		lastScanTime, fresh, _ := fetchScans(stage1MatchID)
 		if fresh {
-			fetchLeaderboard()
+			fetchLeaderboard(1)
 			// Schedule next poll for when the scan will be scanMaxAge old
 			waitDur := time.Until(lastScanTime.Add(scanMaxAge))
 			if waitDur < 0 {
@@ -401,53 +537,154 @@ func backgroundFetcher() {
 	}
 }
 
+// backgroundStage2Fetcher manages Stage 2 data fetching using a timer-based
+// approach: sleep until a match is about to start, poll until it completes,
+// then sleep until the next match, and so on.
+func backgroundStage2Fetcher() {
+	fetchLeaderboard(2)
+	for {
+		stage2Mu.RLock()
+		rounds := cachedStage2
+		stage2Mu.RUnlock()
+
+		now := time.Now().Unix()
+		var activeMatchID string
+		var nextMatchTime int64
+
+		for _, round := range rounds {
+			for _, match := range round.Matches {
+				if match.CompletionTimeUnix != nil {
+					continue // already finished
+				}
+				if match.ScheduledTimeUnix > 0 && match.ScheduledTimeUnix <= now {
+					// Started but not yet complete — poll this one
+					if activeMatchID == "" {
+						activeMatchID = match.ID
+					}
+				} else if match.ScheduledTimeUnix > now {
+					// Future match — track the earliest
+					if nextMatchTime == 0 || match.ScheduledTimeUnix < nextMatchTime {
+						nextMatchTime = match.ScheduledTimeUnix
+					}
+				}
+			}
+		}
+
+		if activeMatchID != "" {
+			log.Printf("[Stage2] Polling active match %s", activeMatchID)
+			pollStage2MatchUntilComplete(activeMatchID)
+			continue
+		}
+
+		if nextMatchTime > 0 {
+			// Wake up 30s before the match starts so we are ready to poll
+			sleepUntil := time.Unix(nextMatchTime, 0).Add(-30 * time.Second)
+			waitDur := time.Until(sleepUntil)
+			if waitDur < 0 {
+				waitDur = 0
+			}
+			log.Printf("[Stage2] No active matches. Next match at %v, sleeping %v",
+				time.Unix(nextMatchTime, 0).UTC().Format(time.RFC3339),
+				waitDur.Round(time.Second))
+			time.Sleep(waitDur)
+			fetchLeaderboard(2)
+			continue
+		}
+
+		log.Printf("[Stage2] All matches complete, background fetcher stopping")
+		return
+	}
+}
+
+// pollStage2MatchUntilComplete polls the scan API for the given match and
+// refreshes the Stage 2 cache until the match shows a completion time.
+func pollStage2MatchUntilComplete(matchID string) {
+	for {
+		// Check cache first — may already be complete
+		stage2Mu.RLock()
+		cached := cachedStage2
+		stage2Mu.RUnlock()
+		for _, round := range cached {
+			for _, match := range round.Matches {
+				if match.ID == matchID && match.CompletionTimeUnix != nil {
+					log.Printf("[Stage2] Match %s is complete", matchID)
+					return
+				}
+			}
+		}
+
+		scanTime, fresh, notStarted := fetchScans(matchID)
+		if notStarted {
+			log.Printf("[Stage2] Match %s: scanning not started yet, waiting 5 minutes", matchID)
+			time.Sleep(5 * time.Minute)
+		} else if fresh {
+			fetchLeaderboard(2)
+			waitDur := time.Until(scanTime.Add(scanMaxAge))
+			if waitDur < 0 {
+				waitDur = 0
+			}
+			log.Printf("[Stage2] Match %s: next poll in %v", matchID, waitDur.Round(time.Second))
+			time.Sleep(waitDur)
+		} else {
+			age := time.Since(scanTime).Round(time.Second)
+			log.Printf("[Stage2] Match %s: stale scan (age: %v), retrying in %v", matchID, age, retryPollInterval)
+			time.Sleep(retryPollInterval)
+		}
+	}
+}
+
 type APIResponse struct {
 	Stages [][]Stage `json:"stages"`
 }
 
-func fetchScans() (lastScanTime time.Time, fresh bool) {
-	resp, err := http.Get(scanURL)
+func fetchScans(matchID string) (lastScanTime time.Time, fresh bool, notStarted bool) {
+	resp, err := http.Get(scanURL + "?matchId=" + matchID + "&onlySuccessful=true&limit=1")
 	if err != nil {
-		return time.Now(), false
+		return time.Now(), false, false
 	}
 	defer resp.Body.Close()
 
 	var scansResp ScansResponse
 	if err := json.NewDecoder(resp.Body).Decode(&scansResp); err != nil {
 		log.Printf("Error decoding scans response: %v", err)
-		return time.Now(), false
+		return time.Now(), false, false
 	}
 	if len(scansResp) == 0 {
 		log.Println("No scans found in response")
-		return time.Now(), false
+		return time.Now(), false, true
 	}
 	latestScan := scansResp[0]
 	if latestScan.CompletedAt != "" {
 		lastScanTime, err = time.Parse(time.RFC3339, latestScan.CompletedAt)
 		if err != nil {
 			log.Printf("Error parsing scan completedAt: %v", err)
-			return time.Now(), false
+			return time.Now(), false, false
 		}
 	} else {
 		lastScanTime = time.Now()
 	}
-	return lastScanTime, time.Since(lastScanTime) < scanMaxAge
+	return lastScanTime, time.Since(lastScanTime) < scanMaxAge, false
 }
 
-// fetchLeaderboard fetches from the API, updates the cache, and returns the
-// lastScanTime from the response along with a boolean indicating whether the
-// scan data is fresh (age < scanMaxAge). Broadcasts "refresh" to WS clients
-// when fresh new data is received.
-func fetchLeaderboard() (lastScanTime time.Time, fresh bool) {
-	resp, err := http.Get(apiURL)
+// fetchLeaderboard fetches from the API for the given stage, updates the
+// relevant cache, and broadcasts "refresh" to WS clients when new data arrives.
+func fetchLeaderboard(stage int) (lastScanTime time.Time, fresh bool) {
+	resp, err := http.Get(fmt.Sprintf("%s?stage=%d", apiURL, stage))
 	if err != nil {
-		log.Printf("Error fetching leaderboard: %v", err)
+		log.Printf("Error fetching leaderboard (stage %d): %v", stage, err)
 		return time.Now(), false
 	}
 	defer resp.Body.Close()
 
+	if stage == 1 {
+		return fetchLeaderboardStage1(resp)
+	}
+	return fetchLeaderboardStage2(resp)
+}
+
+func fetchLeaderboardStage1(resp *http.Response) (lastScanTime time.Time, fresh bool) {
 	var apiResp APIResponse
-	if err = json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		log.Printf("Error decoding leaderboard: %v", err)
 		return time.Now(), false
 	}
@@ -459,6 +696,7 @@ func fetchLeaderboard() (lastScanTime time.Time, fresh bool) {
 
 	stage := apiResp.Stages[0][0]
 
+	var err error
 	if stage.LastScan.CompletedAt != "" {
 		lastScanTime, err = time.Parse(time.RFC3339, stage.LastScan.CompletedAt)
 		if err != nil {
@@ -515,6 +753,116 @@ func fetchLeaderboard() (lastScanTime time.Time, fresh bool) {
 	}
 
 	return lastScanTime, fresh
+}
+
+func fetchLeaderboardStage2(resp *http.Response) (lastScanTime time.Time, fresh bool) {
+	var apiResp Stage2RawAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		log.Printf("[Stage2] Error decoding leaderboard: %v", err)
+		return time.Now(), false
+	}
+
+	rounds := make([]Stage2RoundData, 0)
+	for _, rawRound := range apiResp.Stages {
+		matches := make([]Stage2MatchData, 0)
+		for _, rawMatch := range rawRound {
+			scheduledUnix := int64(0)
+			if rawMatch.ScheduledTime != "" {
+				t, err := time.Parse(time.RFC3339, rawMatch.ScheduledTime)
+				if err == nil {
+					scheduledUnix = t.Unix()
+				}
+			}
+
+			var completionUnix *int64
+			if rawMatch.CompletionTime != nil && *rawMatch.CompletionTime != "" {
+				t, err := time.Parse(time.RFC3339, *rawMatch.CompletionTime)
+				if err == nil {
+					v := t.Unix()
+					completionUnix = &v
+				}
+			}
+
+			// Track latest scan time across all matches
+			if rawMatch.LastScan != nil && rawMatch.LastScan.CompletedAt != "" {
+				t, err := time.Parse(time.RFC3339, rawMatch.LastScan.CompletedAt)
+				if err == nil && t.After(lastScanTime) {
+					lastScanTime = t
+				}
+			}
+
+			players := make([]Stage2PlayerEntry, 0)
+			for _, rp := range rawMatch.Players {
+				var entry Stage2PlayerEntry
+				entry.DisplayPosition = rp.Position + 1
+				entry.SourceRank = rp.Source.Rank
+				entry.SourceName = rp.Source.Name
+				entry.Rank = rp.Rank
+				entry.Score = rp.Score
+				entry.InCompetition = rp.InCompetition
+
+				if rp.Player != nil {
+					entry.Name = rp.Player.Name
+					entry.TrackmaniaID = rp.Player.ID
+					entry.CountryISO2 = rp.Player.CountryISO2
+				} else {
+					entry.IsPlaceholder = true
+				}
+
+				players = append(players, entry)
+			}
+
+			matches = append(matches, Stage2MatchData{
+				ID:                 rawMatch.ID,
+				Name:               rawMatch.Name,
+				ScheduledTimeUnix:  scheduledUnix,
+				CompletionTimeUnix: completionUnix,
+				Players:            players,
+			})
+		}
+		rounds = append(rounds, Stage2RoundData{Matches: matches})
+	}
+
+	if lastScanTime.IsZero() {
+		lastScanTime = time.Now()
+	}
+	fresh = time.Since(lastScanTime) < scanMaxAge
+
+	stage2Mu.Lock()
+	prevUpdatedAt := stage2UpdatedAt
+	cachedStage2 = rounds
+	stage2UpdatedAt = lastScanTime
+	stage2Mu.Unlock()
+
+	saveStage2Cache(rounds, lastScanTime)
+
+	log.Printf("[Stage2] Cache updated: %d rounds (last scan: %s, fresh: %v)", len(rounds), lastScanTime.Format(time.RFC3339), fresh)
+
+	if fresh && lastScanTime.After(prevUpdatedAt) {
+		hub.broadcast <- []byte("refresh")
+	}
+
+	return lastScanTime, fresh
+}
+
+func apiStage2(w http.ResponseWriter, r *http.Request) {
+	stage2Mu.RLock()
+	rounds := cachedStage2
+	updatedAt := stage2UpdatedAt
+	stage2Mu.RUnlock()
+
+	if len(rounds) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Stage 2 data not yet available"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(Stage2APIResponse{
+		Rounds:        rounds,
+		UpdatedAtUnix: updatedAt.Unix(),
+	})
 }
 
 func getTopPercentage(total int, rank int) float64 {
