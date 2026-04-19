@@ -55,6 +55,11 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [showDropdown, setShowDropdown] = useState(false);
+  const [stage2SearchQuery, setStage2SearchQuery] = useState("");
+  const [stage2SearchResults, setStage2SearchResults] = useState<
+    { name: string; countryISO2: string }[]
+  >([]);
+  const [stage2ShowDropdown, setStage2ShowDropdown] = useState(false);
   const [elapsed, setElapsed] = useState("");
   const [collapsedRounds, setCollapsedRounds] = useState<Set<number>>(
     new Set(),
@@ -260,13 +265,37 @@ function App() {
         block: "center",
       });
     }
-  }, [highlight, data]);
+  }, [highlight, data, stage2Data]);
 
-  // Close search dropdown on outside click
+  // Auto-expand rounds containing the highlighted player (stage 2)
+  useEffect(() => {
+    if (stage !== 2 || !highlight || !stage2Data) return;
+    const allMatches = (stage2Data.rounds ?? []).flatMap(
+      (r) => r.matches ?? [],
+    );
+    const roundsToExpand = new Set<number>();
+    for (const match of allMatches) {
+      const m = match.name.match(/Round\s+(\d+)/i);
+      const roundNum = m ? parseInt(m[1]) : 0;
+      if ((match.players ?? []).some((p) => p.name === highlight)) {
+        roundsToExpand.add(roundNum);
+      }
+    }
+    if (roundsToExpand.size > 0) {
+      setCollapsedRounds((prev) => {
+        const next = new Set(prev);
+        roundsToExpand.forEach((rn) => next.delete(rn));
+        return next;
+      });
+    }
+  }, [highlight, stage, stage2Data]);
+
+  // Close search dropdowns on outside click
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
       if (!(e.target as Element).closest(".search-wrap")) {
         setShowDropdown(false);
+        setStage2ShowDropdown(false);
       }
     };
     document.addEventListener("click", handleClick);
@@ -312,6 +341,44 @@ function App() {
     setHighlight(result.name);
     setShowDropdown(false);
     setSearchQuery("");
+  };
+
+  const handleStage2Search = (q: string) => {
+    setStage2SearchQuery(q);
+    if (q.trim().length < 2) {
+      setStage2ShowDropdown(false);
+      setStage2SearchResults([]);
+      return;
+    }
+    if (!stage2Data) return;
+    const query = q.trim().toLowerCase();
+    const seen = new Set<string>();
+    const results: { name: string; countryISO2: string }[] = [];
+    for (const round of stage2Data.rounds ?? []) {
+      for (const match of round.matches ?? []) {
+        for (const player of match.players ?? []) {
+          if (
+            !player.isPlaceholder &&
+            !seen.has(player.name) &&
+            player.name.toLowerCase().includes(query)
+          ) {
+            seen.add(player.name);
+            results.push({
+              name: player.name,
+              countryISO2: player.countryISO2,
+            });
+          }
+        }
+      }
+    }
+    setStage2SearchResults(results.slice(0, 20));
+    setStage2ShowDropdown(true);
+  };
+
+  const handleStage2SearchResultClick = (name: string) => {
+    setHighlight(name);
+    setStage2SearchQuery("");
+    setStage2ShowDropdown(false);
   };
 
   const handleStageChange = (newStage: number) => {
@@ -408,6 +475,7 @@ function App() {
     }
 
     const nowUnix = Date.now() / 1000;
+    let firstHighlightSeen = false;
 
     // Flatten all matches and group by round number parsed from match name
     const allMatches = (stage2Data.rounds ?? []).flatMap(
@@ -507,6 +575,13 @@ function App() {
                                   </thead>
                                   <tbody>
                                     {(match.players ?? []).map((player, pi) => {
+                                      const isHighlighted =
+                                        !player.isPlaceholder &&
+                                        highlight === player.name;
+                                      const isFirstHighlight =
+                                        isHighlighted && !firstHighlightSeen;
+                                      if (isFirstHighlight)
+                                        firstHighlightSeen = true;
                                       const medalClass =
                                         player.displayPosition === 1
                                           ? "gold"
@@ -516,7 +591,20 @@ function App() {
                                               ? "bronze"
                                               : "";
                                       return (
-                                        <tr key={pi} className={medalClass}>
+                                        <tr
+                                          key={pi}
+                                          className={[
+                                            medalClass,
+                                            isHighlighted ? "highlighted" : "",
+                                          ]
+                                            .filter(Boolean)
+                                            .join(" ")}
+                                          ref={
+                                            isFirstHighlight
+                                              ? highlightRef
+                                              : undefined
+                                          }
+                                        >
                                           <td className="rank-col">
                                             {player.displayPosition}
                                           </td>
@@ -844,6 +932,64 @@ function App() {
             <span className="stage2-section-sub">
               Updated only after match completions
             </span>
+          </div>
+          <div className="search-row">
+            <div className="search-wrap">
+              <span className="search-icon">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="15"
+                  height="15"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                >
+                  <path
+                    fillRule="evenodd"
+                    d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z"
+                    clipRule="evenodd"
+                  />
+                </svg>
+              </span>
+              <input
+                type="text"
+                placeholder="Search players..."
+                autoComplete="off"
+                value={stage2SearchQuery}
+                onChange={(e) => handleStage2Search(e.target.value)}
+              />
+              {stage2ShowDropdown && (
+                <div className="search-dropdown">
+                  {stage2SearchResults.length === 0 ? (
+                    <div className="no-results">No players found</div>
+                  ) : (
+                    stage2SearchResults.map((r, i) => (
+                      <a
+                        key={i}
+                        onClick={() => handleStage2SearchResultClick(r.name)}
+                      >
+                        <img
+                          src={`https://flagcdn.com/20x15/${r.countryISO2.toLowerCase()}.png`}
+                          onError={(e) => {
+                            e.currentTarget.style.display = "none";
+                          }}
+                          alt=""
+                          title={countryName(r.countryISO2)}
+                        />
+                        <span className="sr-name">{r.name}</span>
+                      </a>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+            {highlight && (
+              <button
+                className="clear-highlight"
+                onClick={() => setHighlight(null)}
+              >
+                Clear highlight
+              </button>
+            )}
           </div>
           {renderStage2()}
         </>
