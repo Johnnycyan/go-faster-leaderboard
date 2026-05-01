@@ -46,6 +46,8 @@ export interface Stage2PlayerEntry {
   rank: number | null;
   score: number | null;
   inCompetition: boolean;
+  progression: string;
+  progressionType: "finals" | "advance" | "eliminated" | "conditional" | "";
 }
 
 export interface Stage2MatchData {

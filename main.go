@@ -109,6 +109,8 @@ var (
 	playerIDMu       sync.Mutex
 	playerIDCacheDur = 24 * time.Hour
 
+	mockMode bool
+
 	scanMaxAge        time.Duration
 	retryPollInterval = 5 * time.Second
 
@@ -188,6 +190,8 @@ type Stage2PlayerEntry struct {
 	Rank            *int   `json:"rank"`
 	Score           *int   `json:"score"`
 	InCompetition   bool   `json:"inCompetition"`
+	Progression     string `json:"progression"`
+	ProgressionType string `json:"progressionType"`
 }
 
 type Stage2MatchData struct {
@@ -419,6 +423,33 @@ func loadStage2Cache() {
 	log.Printf("Loaded stage2 cache from disk: %d rounds", len(data.Rounds))
 }
 
+func loadMockStage2() bool {
+	const mockFile = "mock/stage2.json"
+	if _, err := os.Stat(mockFile); os.IsNotExist(err) {
+		return false
+	}
+	b, err := os.ReadFile(mockFile)
+	if err != nil {
+		log.Printf("[Mock] Error reading %s: %v", mockFile, err)
+		return false
+	}
+	var data DiskStage2Cache
+	if err := json.Unmarshal(b, &data); err != nil {
+		log.Printf("[Mock] Error parsing %s: %v", mockFile, err)
+		return false
+	}
+	stage2Mu.Lock()
+	cachedStage2 = data.Rounds
+	if !data.UpdatedAt.IsZero() {
+		stage2UpdatedAt = data.UpdatedAt
+	} else {
+		stage2UpdatedAt = time.Now()
+	}
+	stage2Mu.Unlock()
+	log.Printf("[Mock] Loaded mock stage2 data from %s: %d rounds", mockFile, len(data.Rounds))
+	return true
+}
+
 func loadPlayerIDCache() map[string]PlayerIDEntry {
 	b, err := os.ReadFile(filepath.Join(cacheDir, "playerids.json"))
 	if err != nil {
@@ -479,10 +510,16 @@ func main() {
 	}
 	loadLeaderboardCache()
 	loadStage2Cache()
+	if loadMockStage2() {
+		mockMode = true
+		log.Printf("[Mock] Mock mode enabled — Stage 2 live fetching disabled")
+	}
 
 	go hub.run()
 	go backgroundFetcher()
-	go backgroundStage2Fetcher()
+	if !mockMode {
+		go backgroundStage2Fetcher()
+	}
 
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/cmd", getLeaderboardRank)
@@ -577,6 +614,10 @@ func backgroundStage2Fetcher() {
 		}
 
 		if nextMatchTime > 0 {
+			// If completed matches exist, poll every 5 minutes until at least one
+			// future match has all its player slots filled in.
+			pollUntilFutureMatchesFilled()
+
 			// Wake up 30s before the match starts so we are ready to poll
 			sleepUntil := time.Unix(nextMatchTime, 0).Add(-30 * time.Second)
 			waitDur := time.Until(sleepUntil)
@@ -596,11 +637,62 @@ func backgroundStage2Fetcher() {
 	}
 }
 
-// pollStage2MatchUntilComplete polls the scan API for the given match and
+// pollUntilFutureMatchesFilled polls every 5 minutes while all future matches
+// have at least one placeholder player and none are fully filled yet. It
+// returns as soon as at least one future match has all players identified, or
+// there are no more future matches with placeholder players.
+func pollUntilFutureMatchesFilled() {
+	for {
+		now := time.Now().Unix()
+		stage2Mu.RLock()
+		rounds := cachedStage2
+		stage2Mu.RUnlock()
+
+		var hasUnfilled, hasOneFilled bool
+		for _, round := range rounds {
+			for _, match := range round.Matches {
+				if match.CompletionTimeUnix != nil {
+					continue // already finished
+				}
+				if match.ScheduledTimeUnix > 0 && match.ScheduledTimeUnix <= now {
+					continue // already started
+				}
+				// future match
+				if len(match.Players) == 0 {
+					continue
+				}
+				allFilled := true
+				for _, p := range match.Players {
+					if p.IsPlaceholder {
+						allFilled = false
+						hasUnfilled = true
+						break
+					}
+				}
+				if allFilled {
+					hasOneFilled = true
+				}
+			}
+		}
+
+		// Done if no future match needs filling or at least one is fully filled
+		if !hasUnfilled || hasOneFilled {
+			return
+		}
+
+		log.Printf("[Stage2] Future matches have unfilled players, refreshing in 5 minutes")
+		time.Sleep(5 * time.Minute)
+		fetchLeaderboard(2)
+	}
+}
+
+// pollStage2MatchUntilComplete polls the data API for the given match and
 // refreshes the Stage 2 cache until the match shows a completion time.
 func pollStage2MatchUntilComplete(matchID string) {
 	for {
-		// Check cache first — may already be complete
+		fetchLeaderboard(2)
+
+		// Check if the match is now complete in the updated cache
 		stage2Mu.RLock()
 		cached := cachedStage2
 		stage2Mu.RUnlock()
@@ -613,23 +705,8 @@ func pollStage2MatchUntilComplete(matchID string) {
 			}
 		}
 
-		scanTime, fresh, notStarted := fetchScans(matchID)
-		if notStarted {
-			log.Printf("[Stage2] Match %s: scanning not started yet, waiting 5 minutes", matchID)
-			time.Sleep(5 * time.Minute)
-		} else if fresh {
-			fetchLeaderboard(2)
-			waitDur := time.Until(scanTime.Add(scanMaxAge))
-			if waitDur < 0 {
-				waitDur = 0
-			}
-			log.Printf("[Stage2] Match %s: next poll in %v", matchID, waitDur.Round(time.Second))
-			time.Sleep(waitDur)
-		} else {
-			age := time.Since(scanTime).Round(time.Second)
-			log.Printf("[Stage2] Match %s: stale scan (age: %v), retrying in %v", matchID, age, retryPollInterval)
-			time.Sleep(retryPollInterval)
-		}
+		log.Printf("[Stage2] Match %s: not yet complete, retrying in %v", matchID, 5*time.Minute)
+		time.Sleep(5 * time.Minute)
 	}
 }
 
@@ -755,6 +832,58 @@ func fetchLeaderboardStage1(resp *http.Response) (lastScanTime time.Time, fresh 
 	return lastScanTime, fresh
 }
 
+// stage2Progression returns a human-readable progression label and a type tag
+// ("finals", "advance", "eliminated") for a player based on their final rank
+// and which round (0-indexed) the match belongs to.
+func stage2Progression(roundIndex, rank int) (progression, progressionType string) {
+	switch roundIndex {
+	case 0: // Round 1 — 4 matches of 25
+		switch {
+		case rank == 1:
+			return "Qualifies for Stage 3 Finals", "finals"
+		case rank <= 8:
+			return "Advances to Round 2 (Second Chance)", "advance"
+		case rank <= 12:
+			return "Advances to Round 3 (Survival)", "advance"
+		default:
+			return "Eliminated", "eliminated"
+		}
+	case 1: // Round 2 — Second Chance, 2 matches of 14
+		switch {
+		case rank == 1:
+			return "Qualifies for Stage 3 Finals", "finals"
+		case rank <= 4:
+			return "Advances to Round 4 (Final Chance)", "advance"
+		default:
+			return "Advances to Round 3 (Survival)", "advance"
+		}
+	case 2: // Round 3 — Survival, 2 matches of 18
+		switch {
+		case rank <= 4:
+			return "Advances to Round 4 (Final Chance)", "advance"
+		default:
+			return "Eliminated", "eliminated"
+		}
+	case 3: // Round 4 — Final Chance, 1 match of 14
+		switch {
+		case rank == 1:
+			return "Qualifies for Stage 3 Finals", "finals"
+		case rank == 2:
+			return "Conditionally qualifies for Stage 3 Finals", "conditional"
+		default:
+			return "Eliminated", "eliminated"
+		}
+	case 4: // Round 5 — Dutch Qualification (optional), 1 match of 4
+		switch {
+		case rank == 1:
+			return "Qualifies for Stage 3 Finals", "finals"
+		default:
+			return "Eliminated", "eliminated"
+		}
+	}
+	return "", ""
+}
+
 func fetchLeaderboardStage2(resp *http.Response) (lastScanTime time.Time, fresh bool) {
 	var apiResp Stage2RawAPIResponse
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
@@ -763,7 +892,7 @@ func fetchLeaderboardStage2(resp *http.Response) (lastScanTime time.Time, fresh 
 	}
 
 	rounds := make([]Stage2RoundData, 0)
-	for _, rawRound := range apiResp.Stages {
+	for roundIdx, rawRound := range apiResp.Stages {
 		matches := make([]Stage2MatchData, 0)
 		for _, rawMatch := range rawRound {
 			scheduledUnix := int64(0)
@@ -807,6 +936,11 @@ func fetchLeaderboardStage2(resp *http.Response) (lastScanTime time.Time, fresh 
 					entry.CountryISO2 = rp.Player.CountryISO2
 				} else {
 					entry.IsPlaceholder = true
+				}
+
+				// Assign progression outcome for completed matches
+				if completionUnix != nil && rp.Rank != nil {
+					entry.Progression, entry.ProgressionType = stage2Progression(roundIdx, *rp.Rank)
 				}
 
 				players = append(players, entry)

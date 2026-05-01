@@ -1,6 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import "./App.css";
-import type { LeaderboardData, SearchResult, Stage2Data } from "./types";
+import type {
+  LeaderboardData,
+  SearchResult,
+  Stage2Data,
+  Stage2PlayerEntry,
+} from "./types";
 
 const regionNames = new Intl.DisplayNames(["en"], { type: "region" });
 function countryName(iso2: string): string {
@@ -32,6 +37,29 @@ function formatElapsed(unixSeconds: number): string {
   return str;
 }
 
+function parseRoundNum(matchName: string): number {
+  if (/dutch/i.test(matchName)) return 5;
+  const m = matchName.match(/Round\s+(\d+)/i);
+  return m ? parseInt(m[1]) : 0;
+}
+
+function roundSectionTitle(roundNum: number): string {
+  switch (roundNum) {
+    case 1:
+      return "Round 1";
+    case 2:
+      return "Round 2 \u2014 Second Chance";
+    case 3:
+      return "Round 3 \u2014 Survival";
+    case 4:
+      return "Round 4 \u2014 Final Chance";
+    case 5:
+      return "Round 5 \u2014 Dutch Qualifier (Optional)";
+    default:
+      return `Round ${roundNum}`;
+  }
+}
+
 function formatScheduledTime(unixSeconds: number): string {
   if (unixSeconds === 0) return "";
   return new Date(unixSeconds * 1000).toLocaleString(undefined, {
@@ -42,6 +70,15 @@ function formatScheduledTime(unixSeconds: number): string {
     timeZoneName: "short",
   });
 }
+
+const progressionAccentColor: Record<string, string> = {
+  "prog-finals": "#28c864",
+  "prog-advance": "#3c8ce6",
+  "prog-eliminated": "#b4283c",
+  "prog-conditional": "#e6be28",
+  "prog-dutch-maybe": "#e6be28",
+  "prog-dutch-confirmed": "#28c896",
+};
 
 function App() {
   const [data, setData] = useState<LeaderboardData | null>(null);
@@ -64,6 +101,13 @@ function App() {
   const [collapsedRounds, setCollapsedRounds] = useState<Set<number>>(
     new Set(),
   );
+  const [tooltip, setTooltip] = useState<{
+    text: string;
+    x: number;
+    y: number;
+    accent: string;
+    pinned: boolean;
+  } | null>(null);
 
   // Auto-collapse rounds: expand only the active/next/last-completed rounds
   useEffect(() => {
@@ -74,8 +118,7 @@ function App() {
     );
     const roundMap = new Map<number, typeof allMatches>();
     for (const match of allMatches) {
-      const m = match.name.match(/Round\s+(\d+)/i);
-      const rn = m ? parseInt(m[1]) : 0;
+      const rn = parseRoundNum(match.name);
       if (!roundMap.has(rn)) roundMap.set(rn, []);
       roundMap.get(rn)!.push(match);
     }
@@ -115,6 +158,8 @@ function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const wsReconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsReconnectDelay = useRef(1000);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const pinnedRowRef = useRef<HTMLTableRowElement | null>(null);
 
   // Read initial URL params (once)
   useEffect(() => {
@@ -275,8 +320,7 @@ function App() {
     );
     const roundsToExpand = new Set<number>();
     for (const match of allMatches) {
-      const m = match.name.match(/Round\s+(\d+)/i);
-      const roundNum = m ? parseInt(m[1]) : 0;
+      const roundNum = parseRoundNum(match.name);
       if ((match.players ?? []).some((p) => p.name === highlight)) {
         roundsToExpand.add(roundNum);
       }
@@ -301,6 +345,27 @@ function App() {
     document.addEventListener("click", handleClick);
     return () => document.removeEventListener("click", handleClick);
   }, []);
+
+  // Dismiss pinned tooltip on outside click/touch
+  useEffect(() => {
+    if (!tooltip?.pinned) return;
+    const dismiss = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Element;
+      if (pinnedRowRef.current && pinnedRowRef.current.contains(target)) return;
+      if (tooltipRef.current && tooltipRef.current.contains(target)) return;
+      pinnedRowRef.current = null;
+      setTooltip(null);
+    };
+    const timer = setTimeout(() => {
+      document.addEventListener("mousedown", dismiss);
+      document.addEventListener("touchstart", dismiss as EventListener);
+    }, 0);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("mousedown", dismiss);
+      document.removeEventListener("touchstart", dismiss as EventListener);
+    };
+  }, [tooltip?.pinned]);
 
   const handleSort = (key: string) => {
     if (sortBy === key) {
@@ -483,8 +548,7 @@ function App() {
     );
     const roundMap = new Map<number, typeof allMatches>();
     for (const match of allMatches) {
-      const m = match.name.match(/Round\s+(\d+)/i);
-      const roundNum = m ? parseInt(m[1]) : 0;
+      const roundNum = parseRoundNum(match.name);
       if (!roundMap.has(roundNum)) roundMap.set(roundNum, []);
       roundMap.get(roundNum)!.push(match);
     }
@@ -492,9 +556,73 @@ function App() {
       ([a], [b]) => a - b,
     );
 
+    // Stage 3 qualification & Dutch Qualifier logic
+    const dutchAlreadyQualified = allMatches
+      .filter((m) => m.completionTimeUnix !== null)
+      .flatMap((m) => m.players ?? [])
+      .some(
+        (p) =>
+          p.progressionType === "finals" &&
+          !p.isPlaceholder &&
+          p.countryISO2.toUpperCase() === "NL",
+      );
+    const round4Matches = roundMap.get(4) ?? [];
+    const round4HasFinished = round4Matches.some(
+      (m) => m.completionTimeUnix !== null,
+    );
+    // Build qualifier list — show as soon as any match produces a qualifier.
+    // Round 5 (Dutch Qualifier) is excluded from the main loop and handled separately.
+    const finalQualifiers: Array<{
+      player: Stage2PlayerEntry;
+      matchName: string;
+    }> = [];
+    for (const [roundNum, roundMatches] of sortedRounds) {
+      if (roundNum === 5) continue;
+      for (const match of roundMatches) {
+        if (match.completionTimeUnix === null) continue;
+        for (const player of match.players ?? []) {
+          if (player.progressionType === "finals" && !player.isPlaceholder) {
+            finalQualifiers.push({ player, matchName: match.name });
+          }
+        }
+      }
+    }
+    // Add the conditional 8th slot once we know which path was taken
+    if (dutchAlreadyQualified) {
+      // Dutch player already in Stage 3 — R4 P2 gets the direct spot
+      for (const match of round4Matches) {
+        if (match.completionTimeUnix === null) continue;
+        const p = (match.players ?? []).find(
+          (p) => p.progressionType === "conditional" && !p.isPlaceholder,
+        );
+        if (p) {
+          finalQualifiers.push({ player: p, matchName: match.name });
+          break;
+        }
+      }
+    } else {
+      // Dutch Qualifier winner gets the 8th slot (only once that match finishes)
+      for (const match of roundMap.get(5) ?? []) {
+        if (match.completionTimeUnix === null) continue;
+        const p = (match.players ?? []).find(
+          (p) => p.progressionType === "finals" && !p.isPlaceholder,
+        );
+        if (p) {
+          finalQualifiers.push({ player: p, matchName: match.name });
+          break;
+        }
+      }
+    }
+    const showQualifierPreview = finalQualifiers.length > 0;
+    const showFootnote = round4HasFinished && !dutchAlreadyQualified;
+    // Hide the Dutch Qualifier round section when it is not needed
+    const visibleRounds = dutchAlreadyQualified
+      ? sortedRounds.filter(([n]) => n !== 5)
+      : sortedRounds;
+
     return (
       <div className="stage2-rounds">
-        {sortedRounds.map(([roundNum, matches]) => {
+        {visibleRounds.map(([roundNum, matches]) => {
           const isCollapsed = collapsedRounds.has(roundNum);
           return (
             <div key={roundNum} className="stage2-round-section">
@@ -503,7 +631,7 @@ function App() {
                 onClick={() => toggleRound(roundNum)}
               >
                 <span className="round-section-title">
-                  Round {roundNum === 0 ? "?" : roundNum}
+                  {roundSectionTitle(roundNum)}
                 </span>
                 <span
                   className={`round-chevron${isCollapsed ? " collapsed" : ""}`}
@@ -582,28 +710,131 @@ function App() {
                                         isHighlighted && !firstHighlightSeen;
                                       if (isFirstHighlight)
                                         firstHighlightSeen = true;
-                                      const medalClass =
-                                        player.displayPosition === 1
-                                          ? "gold"
-                                          : player.displayPosition === 2
-                                            ? "silver"
-                                            : player.displayPosition === 3
-                                              ? "bronze"
-                                              : "";
+                                      const isDutchCandidate =
+                                        isFinished &&
+                                        !player.isPlaceholder &&
+                                        !dutchAlreadyQualified &&
+                                        player.progressionType ===
+                                          "eliminated" &&
+                                        player.countryISO2.toUpperCase() ===
+                                          "NL" &&
+                                        [1, 3, 4].includes(roundNum);
+                                      const progressionClass = (() => {
+                                        if (!isFinished)
+                                          return player.displayPosition === 1
+                                            ? "gold"
+                                            : player.displayPosition === 2
+                                              ? "silver"
+                                              : player.displayPosition === 3
+                                                ? "bronze"
+                                                : "";
+                                        if (isDutchCandidate)
+                                          return round4HasFinished
+                                            ? "prog-dutch-confirmed"
+                                            : "prog-dutch-maybe";
+                                        if (
+                                          player.progressionType ===
+                                          "conditional"
+                                        ) {
+                                          if (dutchAlreadyQualified)
+                                            return "prog-finals";
+                                          if (
+                                            player.countryISO2.toUpperCase() ===
+                                            "NL"
+                                          )
+                                            return "prog-dutch-confirmed";
+                                          return "prog-eliminated";
+                                        }
+                                        return player.progressionType
+                                          ? `prog-${player.progressionType}`
+                                          : "";
+                                      })();
+                                      const progressionTitle = (() => {
+                                        if (!isFinished || !player.progression)
+                                          return undefined;
+                                        if (isDutchCandidate)
+                                          return round4HasFinished
+                                            ? "Candidate for Dutch Qualifier"
+                                            : "May be selected for Dutch Qualifier";
+                                        if (
+                                          player.progressionType ===
+                                          "conditional"
+                                        ) {
+                                          if (dutchAlreadyQualified)
+                                            return "Qualifies for Stage 3 Finals";
+                                          if (
+                                            player.countryISO2.toUpperCase() ===
+                                            "NL"
+                                          )
+                                            return "Advances to Dutch Qualifier";
+                                          return "Eliminated";
+                                        }
+                                        return player.progression;
+                                      })();
                                       return (
                                         <tr
                                           key={pi}
                                           className={[
-                                            medalClass,
+                                            progressionClass,
                                             isHighlighted ? "highlighted" : "",
                                           ]
                                             .filter(Boolean)
                                             .join(" ")}
+                                          style={{
+                                            cursor: progressionTitle
+                                              ? "pointer"
+                                              : undefined,
+                                          }}
                                           ref={
                                             isFirstHighlight
                                               ? highlightRef
                                               : undefined
                                           }
+                                          onMouseEnter={(e) => {
+                                            if (
+                                              pinnedRowRef.current ||
+                                              !progressionTitle
+                                            )
+                                              return;
+                                            const rect =
+                                              e.currentTarget.getBoundingClientRect();
+                                            setTooltip({
+                                              text: progressionTitle,
+                                              x: rect.left + rect.width / 2,
+                                              y: rect.top - 6,
+                                              accent:
+                                                progressionAccentColor[
+                                                  progressionClass
+                                                ] ?? "#1e3a58",
+                                              pinned: false,
+                                            });
+                                          }}
+                                          onMouseLeave={() => {
+                                            if (!pinnedRowRef.current)
+                                              setTooltip(null);
+                                          }}
+                                          onClick={(e) => {
+                                            if (!progressionTitle) return;
+                                            const el = e.currentTarget;
+                                            if (pinnedRowRef.current === el) {
+                                              pinnedRowRef.current = null;
+                                              setTooltip(null);
+                                            } else {
+                                              pinnedRowRef.current = el;
+                                              const rect =
+                                                el.getBoundingClientRect();
+                                              setTooltip({
+                                                text: progressionTitle,
+                                                x: rect.left + rect.width / 2,
+                                                y: rect.top - 6,
+                                                accent:
+                                                  progressionAccentColor[
+                                                    progressionClass
+                                                  ] ?? "#1e3a58",
+                                                pinned: true,
+                                              });
+                                            }
+                                          }}
                                         >
                                           <td className="rank-col">
                                             {player.displayPosition}
@@ -664,6 +895,47 @@ function App() {
             </div>
           );
         })}
+        {showFootnote && (
+          <div className="stage2-footnote">
+            Round 4 runner-up qualifies for Stage 3 Finals only if a Dutch
+            player already secured a Finals spot in a previous round. Otherwise,
+            they may or may not advance to the Dutch Qualifier depending on
+            whether they are Dutch.
+          </div>
+        )}
+        {showQualifierPreview && (
+          <div className="stage2-qualifier-preview">
+            <div className="qualifier-preview-title">
+              Stage 3 Qualifiers Preview{" "}
+              <span className="qualifier-unofficial">(Unofficial)</span>
+            </div>
+            <table className="qualifier-preview-table">
+              <tbody>
+                {finalQualifiers.map(({ player, matchName }, i) => (
+                  <tr key={i}>
+                    <td className="qp-num">{i + 1}</td>
+                    <td className="qp-player">
+                      <div className="player-inner">
+                        {player.countryISO2 && (
+                          <img
+                            src={`https://flagcdn.com/20x15/${player.countryISO2.toLowerCase()}.png`}
+                            alt={player.countryISO2}
+                            title={countryName(player.countryISO2)}
+                            onError={(e) => {
+                              e.currentTarget.style.display = "none";
+                            }}
+                          />
+                        )}
+                        <span className="player-name">{player.name}</span>
+                      </div>
+                    </td>
+                    <td className="qp-source">{matchName}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     );
   };
@@ -993,6 +1265,20 @@ function App() {
           </div>
           {renderStage2()}
         </>
+      )}
+
+      {tooltip && (
+        <div
+          ref={tooltipRef}
+          className="player-tooltip"
+          style={{
+            left: tooltip.x,
+            top: tooltip.y,
+            borderTopColor: tooltip.accent,
+          }}
+        >
+          {tooltip.text}
+        </div>
       )}
     </div>
   );

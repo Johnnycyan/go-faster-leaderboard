@@ -374,6 +374,56 @@ tr.bronze .player-name {
   color: #cd7f32;
 }
 
+/* ── Stage 2 Progression ── */
+tr.prog-finals {
+  background: linear-gradient(
+    90deg,
+    rgba(40, 200, 100, 0.12) 0%,
+    transparent 50%
+  );
+  border-left: 3px solid #28c864;
+}
+tr.prog-advance {
+  background: linear-gradient(
+    90deg,
+    rgba(60, 140, 230, 0.12) 0%,
+    transparent 50%
+  );
+  border-left: 3px solid #3c8ce6;
+}
+tr.prog-eliminated {
+  background: linear-gradient(
+    90deg,
+    rgba(180, 40, 60, 0.1) 0%,
+    transparent 50%
+  );
+  border-left: 3px solid #b4283c;
+}
+tr.prog-conditional {
+  background: linear-gradient(
+    90deg,
+    rgba(230, 190, 40, 0.12) 0%,
+    transparent 50%
+  );
+  border-left: 3px solid #e6be28;
+}
+tr.prog-dutch-maybe {
+  background: linear-gradient(
+    90deg,
+    rgba(230, 190, 40, 0.12) 0%,
+    transparent 50%
+  );
+  border-left: 3px solid #e6be28;
+}
+tr.prog-dutch-confirmed {
+  background: linear-gradient(
+    90deg,
+    rgba(40, 200, 150, 0.13) 0%,
+    transparent 50%
+  );
+  border-left: 3px solid #28c896;
+}
+
 /* ── Map Rank ── */
 .map-rank {
   color: #687d92;
@@ -686,4 +736,114 @@ tr.bronze .player-name {
 }
 .source-rank-bronze {
   color: #cd7f32;
+}
+
+/* ── Stage 2 Footnote ── */
+.stage2-footnote {
+  font-size: 0.8rem;
+  color: #4a6278;
+  font-style: italic;
+  padding: 4px 8px;
+  border-left: 2px solid #1a2e44;
+}
+
+/* ── Stage 3 Qualifier Preview ── */
+.stage2-qualifier-preview {
+  border: 1px solid #1a3a28;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0a1a10;
+}
+.qualifier-preview-title {
+  padding: 13px 20px;
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #3da868;
+  background: #0d1f14;
+  border-bottom: 1px solid #1a3a28;
+}
+.qualifier-unofficial {
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: #4a7860;
+  letter-spacing: 0.03em;
+  text-transform: none;
+}
+.qualifier-preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+.qualifier-preview-table tbody tr {
+  border-bottom: 1px solid #0f2a1c;
+  transition: background 0.1s;
+}
+.qualifier-preview-table tbody tr:last-child {
+  border-bottom: none;
+}
+.qualifier-preview-table tbody tr:hover {
+  background: rgba(40, 200, 100, 0.04);
+}
+.qualifier-preview-table td {
+  padding: 10px 16px;
+  color: #c8d6e5;
+}
+.qp-num {
+  width: 40px;
+  color: #3da868;
+  font-weight: 700;
+}
+.qp-source {
+  font-size: 0.78rem;
+  color: #4a6278;
+  text-align: right;
+}
+.qualifier-asterisk {
+  margin-left: 3px;
+  color: #ffd700;
+  font-size: 0.85em;
+  vertical-align: super;
+}
+
+/* ── Player Progression Tooltip ── */
+.player-tooltip {
+  position: fixed;
+  z-index: 1000;
+  background: #0e1a27;
+  border: 1px solid #1e3a58;
+  border-top-width: 2px;
+  border-radius: 7px;
+  padding: 8px 14px;
+  font-size: 0.82rem;
+  color: #c8d6e5;
+  pointer-events: none;
+  max-width: 260px;
+  white-space: normal;
+  text-align: center;
+  line-height: 1.4;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
+  transform: translateX(-50%) translateY(calc(-100% - 8px));
+}
+.player-tooltip::after {
+  content: "";
+  position: absolute;
+  bottom: -6px;
+  left: 50%;
+  transform: translateX(-50%);
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top: 6px solid #1e3a58;
+}
+.player-tooltip::before {
+  content: "";
+  position: absolute;
+  bottom: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 5px solid #0e1a27;
+  z-index: 1;
 }
