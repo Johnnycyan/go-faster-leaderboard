@@ -55,6 +55,7 @@ export interface Stage2MatchData {
   name: string;
   scheduledTimeUnix: number;
   completionTimeUnix: number | null;
+  statusOverride?: string;
   players: Stage2PlayerEntry[];
 }
 

@@ -25,3 +25,4 @@ frontend/dist/
 cache/
 .env
 mock/
+match_status.yaml

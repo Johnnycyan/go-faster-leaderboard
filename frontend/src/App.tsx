@@ -74,6 +74,7 @@ function formatScheduledTime(unixSeconds: number): string {
 const progressionAccentColor: Record<string, string> = {
   "prog-finals": "#28c864",
   "prog-advance": "#3c8ce6",
+  "prog-survival": "#e67c28",
   "prog-eliminated": "#b4283c",
   "prog-conditional": "#e6be28",
   "prog-dutch-maybe": "#e6be28",
@@ -570,6 +571,45 @@ function App() {
     const round4HasFinished = round4Matches.some(
       (m) => m.completionTimeUnix !== null,
     );
+    // Compute top-4 Dutch players by furthest round reached (with a non-null score).
+    // A player who made it to Round 3 ranks above one who only reached Round 1, etc.
+    // Players who never showed up (null score) are excluded.
+    const dutchProgress = new Map<
+      string,
+      { roundNum: number; score: number; player: Stage2PlayerEntry }
+    >();
+    if (!dutchAlreadyQualified) {
+      for (const [rn, roundMatches] of sortedRounds) {
+        if (rn === 5) continue;
+        for (const match of roundMatches) {
+          if (match.completionTimeUnix === null) continue;
+          for (const player of match.players ?? []) {
+            if (player.isPlaceholder) continue;
+            if (player.countryISO2.toUpperCase() !== "NL") continue;
+            if (player.score === null) continue; // no-show — excluded
+            const s = player.score ?? 0;
+            const existing = dutchProgress.get(player.trackmaniaId);
+            if (
+              !existing ||
+              rn > existing.roundNum ||
+              (rn === existing.roundNum && s > existing.score)
+            ) {
+              dutchProgress.set(player.trackmaniaId, {
+                roundNum: rn,
+                score: s,
+                player,
+              });
+            }
+          }
+        }
+      }
+    }
+    const dutchCandidateIds = new Set(
+      Array.from(dutchProgress.values())
+        .sort((a, b) => b.roundNum - a.roundNum || b.score - a.score)
+        .slice(0, 4)
+        .map((e) => e.player.trackmaniaId),
+    );
     // Build qualifier list — show as soon as any match produces a qualifier.
     // Round 5 (Dutch Qualifier) is excluded from the main loop and handled separately.
     const finalQualifiers: Array<{
@@ -656,8 +696,10 @@ function App() {
                     const isFinished = match.completionTimeUnix !== null;
                     const isLive =
                       !isFinished &&
-                      match.scheduledTimeUnix > 0 &&
-                      nowUnix >= match.scheduledTimeUnix;
+                      (match.statusOverride === "live" ||
+                        (match.statusOverride !== "upcoming" &&
+                          match.scheduledTimeUnix > 0 &&
+                          nowUnix >= match.scheduledTimeUnix));
                     const statusLabel = isFinished
                       ? "Finished"
                       : isLive
@@ -702,7 +744,13 @@ function App() {
                                     </tr>
                                   </thead>
                                   <tbody>
-                                    {(match.players ?? []).map((player, pi) => {
+                                    {(isFinished
+                                      ? [...(match.players ?? [])].sort(
+                                          (a, b) =>
+                                            (b.score ?? 0) - (a.score ?? 0),
+                                        )
+                                      : (match.players ?? [])
+                                    ).map((player, pi) => {
                                       const isHighlighted =
                                         !player.isPlaceholder &&
                                         highlight === player.name;
@@ -714,11 +762,18 @@ function App() {
                                         isFinished &&
                                         !player.isPlaceholder &&
                                         !dutchAlreadyQualified &&
-                                        player.progressionType ===
-                                          "eliminated" &&
-                                        player.countryISO2.toUpperCase() ===
-                                          "NL" &&
-                                        [1, 3, 4].includes(roundNum);
+                                        player.score !== null &&
+                                        dutchCandidateIds.has(
+                                          player.trackmaniaId,
+                                        ) &&
+                                        roundNum ===
+                                          (dutchProgress.get(
+                                            player.trackmaniaId,
+                                          )?.roundNum ?? -1);
+                                      const noShow =
+                                        isFinished &&
+                                        !player.isPlaceholder &&
+                                        player.score === null;
                                       const progressionClass = (() => {
                                         if (!isFinished)
                                           return player.displayPosition === 1
@@ -728,10 +783,28 @@ function App() {
                                               : player.displayPosition === 3
                                                 ? "bronze"
                                                 : "";
+                                        if (noShow) return "prog-eliminated";
                                         if (isDutchCandidate)
                                           return round4HasFinished
                                             ? "prog-dutch-confirmed"
                                             : "prog-dutch-maybe";
+                                        if (roundNum === 2) {
+                                          const pos = pi + 1;
+                                          if (pos === 1) return "prog-finals";
+                                          if (pos <= 4) return "prog-advance";
+                                          if (pos <= 14) return "prog-survival";
+                                          return "prog-eliminated";
+                                        }
+                                        if (roundNum === 3) {
+                                          const pos = pi + 1;
+                                          if (pos <= 4) return "prog-advance";
+                                          return "prog-eliminated";
+                                        }
+                                        if (roundNum === 4) {
+                                          const pos = pi + 1;
+                                          if (pos === 1) return "prog-finals";
+                                          return "prog-eliminated";
+                                        }
                                         if (
                                           player.progressionType ===
                                           "conditional"
@@ -750,12 +823,36 @@ function App() {
                                           : "";
                                       })();
                                       const progressionTitle = (() => {
-                                        if (!isFinished || !player.progression)
-                                          return undefined;
+                                        if (noShow)
+                                          return "Eliminated (did not show up)";
                                         if (isDutchCandidate)
                                           return round4HasFinished
                                             ? "Candidate for Dutch Qualifier"
                                             : "May be selected for Dutch Qualifier";
+                                        if (roundNum === 2 && isFinished) {
+                                          const pos = pi + 1;
+                                          if (pos === 1)
+                                            return "Qualifies for Stage 3 Finals";
+                                          if (pos <= 4)
+                                            return "Advances to Final Chance (Round 4)";
+                                          if (pos <= 14)
+                                            return "Advances to Survival (Round 3)";
+                                          return "Eliminated";
+                                        }
+                                        if (roundNum === 3 && isFinished) {
+                                          const pos = pi + 1;
+                                          if (pos <= 4)
+                                            return "Advances to Final Chance (Round 4)";
+                                          return "Eliminated";
+                                        }
+                                        if (roundNum === 4 && isFinished) {
+                                          const pos = pi + 1;
+                                          if (pos === 1)
+                                            return "Qualifies for Stage 3 Finals";
+                                          return "Eliminated";
+                                        }
+                                        if (!isFinished || !player.progression)
+                                          return undefined;
                                         if (
                                           player.progressionType ===
                                           "conditional"
@@ -837,7 +934,9 @@ function App() {
                                           }}
                                         >
                                           <td className="rank-col">
-                                            {player.displayPosition}
+                                            {isFinished
+                                              ? pi + 1
+                                              : player.displayPosition}
                                           </td>
                                           <td className="player-col">
                                             {player.isPlaceholder ? (

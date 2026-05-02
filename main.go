@@ -19,6 +19,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/joho/godotenv"
+	"gopkg.in/yaml.v3"
 )
 
 //go:embed frontend/dist
@@ -105,6 +106,12 @@ var (
 	stage2Mu        sync.RWMutex
 	cachedStage2    []Stage2RoundData
 	stage2UpdatedAt time.Time
+
+	// Match status overrides loaded from match_status.yaml
+	// Key: round name (e.g. "Round1"), value: map of match name -> status ("live"/"upcoming")
+	statusOverrideMu   sync.RWMutex
+	statusOverrides    map[string]map[string]string
+	statusOverrideHash string
 
 	playerIDMu       sync.Mutex
 	playerIDCacheDur = 24 * time.Hour
@@ -199,6 +206,7 @@ type Stage2MatchData struct {
 	Name               string              `json:"name"`
 	ScheduledTimeUnix  int64               `json:"scheduledTimeUnix"`
 	CompletionTimeUnix *int64              `json:"completionTimeUnix"`
+	StatusOverride     string              `json:"statusOverride,omitempty"`
 	Players            []Stage2PlayerEntry `json:"players"`
 }
 
@@ -520,6 +528,7 @@ func main() {
 	if !mockMode {
 		go backgroundStage2Fetcher()
 	}
+	go watchMatchStatusOverrides()
 
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/cmd", getLeaderboardRank)
@@ -979,6 +988,45 @@ func fetchLeaderboardStage2(resp *http.Response) (lastScanTime time.Time, fresh 
 	return lastScanTime, fresh
 }
 
+const matchStatusFile = "match_status.yaml"
+
+// watchMatchStatusOverrides polls match_status.yaml every 5 seconds and
+// broadcasts "refresh" to WS clients when the file content changes.
+func watchMatchStatusOverrides() {
+	for {
+		time.Sleep(5 * time.Second)
+		b, err := os.ReadFile(matchStatusFile)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("[StatusOverride] Error reading %s: %v", matchStatusFile, err)
+			}
+			continue
+		}
+
+		hash := fmt.Sprintf("%x", b) // simple content hash
+		statusOverrideMu.RLock()
+		unchanged := hash == statusOverrideHash
+		statusOverrideMu.RUnlock()
+		if unchanged {
+			continue
+		}
+
+		var raw map[string]map[string]string
+		if err := yaml.Unmarshal(b, &raw); err != nil {
+			log.Printf("[StatusOverride] Error parsing %s: %v", matchStatusFile, err)
+			continue
+		}
+
+		statusOverrideMu.Lock()
+		statusOverrides = raw
+		statusOverrideHash = hash
+		statusOverrideMu.Unlock()
+
+		log.Printf("[StatusOverride] %s changed, notifying clients", matchStatusFile)
+		hub.broadcast <- []byte("refresh")
+	}
+}
+
 func apiStage2(w http.ResponseWriter, r *http.Request) {
 	stage2Mu.RLock()
 	rounds := cachedStage2
@@ -992,11 +1040,69 @@ func apiStage2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply status overrides (only for matches without completion data)
+	statusOverrideMu.RLock()
+	overrides := statusOverrides
+	statusOverrideMu.RUnlock()
+
+	if len(overrides) > 0 {
+		// Deep-copy rounds so we don't mutate the cache
+		roundsCopy := make([]Stage2RoundData, len(rounds))
+		for ri, round := range rounds {
+			matchesCopy := make([]Stage2MatchData, len(round.Matches))
+			for mi, match := range round.Matches {
+				matchesCopy[mi] = match
+				if match.CompletionTimeUnix != nil {
+					continue // completed matches are never overridden
+				}
+				// Derive round/match numbers from the match name, e.g.
+				// "Round 2 - Match 1" → roundNum=2, matchNum=1
+				// "Round 4"           → roundNum=4, matchNum=1
+				roundNum, matchNum := parseMatchName(match.Name)
+				if roundNum == 0 {
+					continue
+				}
+				roundKey := fmt.Sprintf("Round%d", roundNum)
+				matchKey := fmt.Sprintf("Match%d", matchNum)
+				for yamlRound, matchMap := range overrides {
+					if strings.EqualFold(yamlRound, roundKey) {
+						for yamlMatch, status := range matchMap {
+							if strings.EqualFold(yamlMatch, matchKey) {
+								matchesCopy[mi].StatusOverride = strings.ToLower(strings.TrimSpace(status))
+							}
+						}
+					}
+				}
+			}
+			roundsCopy[ri] = Stage2RoundData{Matches: matchesCopy}
+		}
+		rounds = roundsCopy
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(Stage2APIResponse{
 		Rounds:        rounds,
 		UpdatedAtUnix: updatedAt.Unix(),
 	})
+}
+
+// parseMatchName extracts the competition round number and match number from a
+// match name like "Round 2 - Match 1" or "Round 4". Returns (0,0) if unparseable.
+func parseMatchName(name string) (roundNum, matchNum int) {
+	// Try "Round X - Match Y"
+	var rn, mn int
+	if n, _ := fmt.Sscanf(name, "Round %d - Match %d", &rn, &mn); n == 2 {
+		return rn, mn
+	}
+	// Try plain "Round X"
+	if n, _ := fmt.Sscanf(name, "Round %d", &rn); n == 1 {
+		return rn, 1
+	}
+	// Dutch Qualifier maps to Round 5
+	if strings.Contains(strings.ToLower(name), "dutch") {
+		return 5, 1
+	}
+	return 0, 0
 }
 
 func getTopPercentage(total int, rank int) float64 {

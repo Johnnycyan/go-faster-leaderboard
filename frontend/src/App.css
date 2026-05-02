@@ -391,6 +391,14 @@ tr.prog-advance {
   );
   border-left: 3px solid #3c8ce6;
 }
+tr.prog-survival {
+  background: linear-gradient(
+    90deg,
+    rgba(230, 124, 40, 0.12) 0%,
+    transparent 50%
+  );
+  border-left: 3px solid #e67c28;
+}
 tr.prog-eliminated {
   background: linear-gradient(
     90deg,
