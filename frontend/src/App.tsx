@@ -558,7 +558,11 @@ function App() {
     );
 
     // Stage 3 qualification & Dutch Qualifier logic
-    const dutchAlreadyQualified = allMatches
+    // Only look at rounds 1–4 — the Dutch Qualifier (Round 5) itself must not
+    // count here, otherwise finishing it would incorrectly flip this flag.
+    const dutchAlreadyQualified = [...roundMap.entries()]
+      .filter(([rn]) => rn !== 5)
+      .flatMap(([, matches]) => matches)
       .filter((m) => m.completionTimeUnix !== null)
       .flatMap((m) => m.players ?? [])
       .some(
@@ -656,10 +660,16 @@ function App() {
     }
     const showQualifierPreview = finalQualifiers.length > 0;
     const showFootnote = round4HasFinished && !dutchAlreadyQualified;
-    // Hide the Dutch Qualifier round section when it is not needed
-    const visibleRounds = dutchAlreadyQualified
-      ? sortedRounds.filter(([n]) => n !== 5)
-      : sortedRounds;
+    // Hide the Dutch Qualifier round section only when it will never be played
+    // (a Dutch player already qualified through rounds 1–4). Once it has
+    // actually run (has a completionTimeUnix), always show it.
+    const round5Finished = (roundMap.get(5) ?? []).some(
+      (m) => m.completionTimeUnix !== null,
+    );
+    const visibleRounds =
+      dutchAlreadyQualified && !round5Finished
+        ? sortedRounds.filter(([n]) => n !== 5)
+        : sortedRounds;
 
     return (
       <div className="stage2-rounds">
@@ -806,6 +816,11 @@ function App() {
                                           if (pos === 1) return "prog-finals";
                                           return "prog-eliminated";
                                         }
+                                        if (roundNum === 5) {
+                                          const pos = pi + 1;
+                                          if (pos === 1) return "prog-finals";
+                                          return "prog-eliminated";
+                                        }
                                         if (
                                           player.progressionType ===
                                           "conditional"
@@ -847,6 +862,12 @@ function App() {
                                           return "Eliminated";
                                         }
                                         if (roundNum === 4 && isFinished) {
+                                          const pos = pi + 1;
+                                          if (pos === 1)
+                                            return "Qualifies for Stage 3 Finals";
+                                          return "Eliminated";
+                                        }
+                                        if (roundNum === 5 && isFinished) {
                                           const pos = pi + 1;
                                           if (pos === 1)
                                             return "Qualifies for Stage 3 Finals";
