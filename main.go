@@ -441,20 +441,97 @@ func loadMockStage2() bool {
 		log.Printf("[Mock] Error reading %s: %v", mockFile, err)
 		return false
 	}
-	var data DiskStage2Cache
-	if err := json.Unmarshal(b, &data); err != nil {
+
+	// Try processed cache format first: {"rounds":[...],"updatedAt":"..."}
+	var cache DiskStage2Cache
+	if err := json.Unmarshal(b, &cache); err != nil {
 		log.Printf("[Mock] Error parsing %s: %v", mockFile, err)
 		return false
 	}
-	stage2Mu.Lock()
-	cachedStage2 = data.Rounds
-	if !data.UpdatedAt.IsZero() {
-		stage2UpdatedAt = data.UpdatedAt
+
+	var rounds []Stage2RoundData
+	var updatedAt time.Time
+
+	if len(cache.Rounds) > 0 {
+		// Processed cache format
+		rounds = cache.Rounds
+		if !cache.UpdatedAt.IsZero() {
+			updatedAt = cache.UpdatedAt
+		} else {
+			updatedAt = time.Now()
+		}
 	} else {
-		stage2UpdatedAt = time.Now()
+		// Fall back to raw API format: {"stages":[[...]]}
+		var apiResp Stage2RawAPIResponse
+		if err := json.Unmarshal(b, &apiResp); err != nil || len(apiResp.Stages) == 0 {
+			log.Printf("[Mock] %s has no recognisable data (tried cache and raw API formats)", mockFile)
+			return false
+		}
+		var lastScan time.Time
+		for roundIdx, rawRound := range apiResp.Stages {
+			matches := make([]Stage2MatchData, 0, len(rawRound))
+			for _, rawMatch := range rawRound {
+				scheduledUnix := int64(0)
+				if rawMatch.ScheduledTime != "" {
+					if t, err := time.Parse(time.RFC3339, rawMatch.ScheduledTime); err == nil {
+						scheduledUnix = t.Unix()
+					}
+				}
+				var completionUnix *int64
+				if rawMatch.CompletionTime != nil && *rawMatch.CompletionTime != "" {
+					if t, err := time.Parse(time.RFC3339, *rawMatch.CompletionTime); err == nil {
+						v := t.Unix()
+						completionUnix = &v
+					}
+				}
+				if rawMatch.LastScan != nil && rawMatch.LastScan.CompletedAt != "" {
+					if t, err := time.Parse(time.RFC3339, rawMatch.LastScan.CompletedAt); err == nil && t.After(lastScan) {
+						lastScan = t
+					}
+				}
+				players := make([]Stage2PlayerEntry, 0, len(rawMatch.Players))
+				for _, rp := range rawMatch.Players {
+					entry := Stage2PlayerEntry{
+						DisplayPosition: rp.Position + 1,
+						SourceRank:      rp.Source.Rank,
+						SourceName:      rp.Source.Name,
+						Rank:            rp.Rank,
+						Score:           rp.Score,
+						InCompetition:   rp.InCompetition,
+					}
+					if rp.Player != nil {
+						entry.Name = rp.Player.Name
+						entry.TrackmaniaID = rp.Player.ID
+						entry.CountryISO2 = rp.Player.CountryISO2
+					} else {
+						entry.IsPlaceholder = true
+					}
+					if completionUnix != nil && rp.Rank != nil {
+						entry.Progression, entry.ProgressionType = stage2Progression(roundIdx, *rp.Rank)
+					}
+					players = append(players, entry)
+				}
+				matches = append(matches, Stage2MatchData{
+					ID:                 rawMatch.ID,
+					Name:               rawMatch.Name,
+					ScheduledTimeUnix:  scheduledUnix,
+					CompletionTimeUnix: completionUnix,
+					Players:            players,
+				})
+			}
+			rounds = append(rounds, Stage2RoundData{Matches: matches})
+		}
+		if lastScan.IsZero() {
+			lastScan = time.Now()
+		}
+		updatedAt = lastScan
 	}
+
+	stage2Mu.Lock()
+	cachedStage2 = rounds
+	stage2UpdatedAt = updatedAt
 	stage2Mu.Unlock()
-	log.Printf("[Mock] Loaded mock stage2 data from %s: %d rounds", mockFile, len(data.Rounds))
+	log.Printf("[Mock] Loaded mock stage2 data from %s: %d rounds", mockFile, len(rounds))
 	return true
 }
 
@@ -602,6 +679,17 @@ func backgroundStage2Fetcher() {
 				if match.CompletionTimeUnix != nil {
 					continue // already finished
 				}
+				// Dutch Qualifier: if still in the future, track its start time so we
+				// sleep until then, but skip pollUntilFutureMatchesFilled (its roster
+				// is determined by our own logic, not API slot-filling).
+				// Once its scheduled time has passed, treat it like any other active match.
+				rn, _ := parseMatchName(match.Name)
+				if rn == 5 && match.ScheduledTimeUnix > now {
+					if nextMatchTime == 0 || match.ScheduledTimeUnix < nextMatchTime {
+						nextMatchTime = match.ScheduledTimeUnix
+					}
+					continue
+				}
 				if match.ScheduledTimeUnix > 0 && match.ScheduledTimeUnix <= now {
 					// Started but not yet complete — poll this one
 					if activeMatchID == "" {
@@ -665,6 +753,12 @@ func pollUntilFutureMatchesFilled() {
 				}
 				if match.ScheduledTimeUnix > 0 && match.ScheduledTimeUnix <= now {
 					continue // already started
+				}
+				// Skip Dutch Qualifier — its roster is determined by our own logic,
+				// not by the API filling player slots in the normal way.
+				rn, _ := parseMatchName(match.Name)
+				if rn == 5 {
+					continue
 				}
 				// future match
 				if len(match.Players) == 0 {
