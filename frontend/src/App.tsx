@@ -618,6 +618,7 @@ function App() {
     }> = [];
     for (const [roundNum, roundMatches] of sortedRounds) {
       if (roundNum === 5) continue;
+      if (roundNum === 3) continue; // Round 3 winners advance to Round 4, not Stage 3
       for (const match of roundMatches) {
         if (match.completionTimeUnix === null) continue;
         for (const player of match.players ?? []) {
